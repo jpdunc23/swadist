@@ -61,7 +61,6 @@ class Trainer():
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             self.writer = SummaryWriter(f'{log_dir}/{self.name}_{timestamp}')
         if data_parallel:
-            self.serial_model = self.model
             self.model = DistributedDataParallel(
                 model, device_ids=[rank], output_device=rank
             )
@@ -115,7 +114,7 @@ class Trainer():
         self.valid_losses = np.empty(self.total_train_epochs)
         self.valid_accs = np.empty(self.total_train_epochs)
 
-        print(f'Starting {epochs}-epoch training loop...')
+        print(f'Starting {self.total_train_epochs}-epoch training loop...')
 
         # vanilla SGD / burn-in
         self._burn_in(epochs)
@@ -152,10 +151,8 @@ class Trainer():
     def _codist(self, epochs):
         self.in_codist = True
 
-        # update the non-DDP model's parameters and remove DDP
-        self.model = self.serial_model.load_state_dict(
-            self.model.state_dict()
-        )
+        # remove DDP
+        self.model = self.model.module
 
         # switch to codistillation loss
         self.loss_fn = CodistillationLoss(self.loss_fn, self.model,

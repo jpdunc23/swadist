@@ -11,7 +11,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
-from torch.nn.parallel import DistributedDataParallel
 
 from swadist.data.loader import get_dataloaders
 from swadist.utils import Trainer, show_imgs
