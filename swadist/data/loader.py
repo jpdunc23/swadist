@@ -43,7 +43,7 @@ def get_dataloaders(dataset='cifar10', root_dir='./data', download=True,
                                                validation_prop=validation_prop,
                                                test=test)
     pin_memory = pin_memory and cuda # only pin if not using CPU
-    # samplers[0] = DistributedSampler(dataset[0]) if data_parallel else samplers[0]
+    samplers[0] = DistributedSampler(datasets[0]) if data_parallel else samplers[0]
 
     loaders = []
     for i, dset in enumerate(datasets):
@@ -124,6 +124,6 @@ def get_cifar10(root_dir='./data', download=False,
     else:
         test_dataset = None
 
-    datasets = (train_dataset, valid_dataset, test_dataset)
-    samplers = (train_sampler, valid_sampler, None)
+    datasets = [train_dataset, valid_dataset, test_dataset]
+    samplers = [train_sampler, valid_sampler, None]
     return datasets, samplers

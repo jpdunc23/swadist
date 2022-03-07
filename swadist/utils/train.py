@@ -8,7 +8,7 @@ import torch
 from torch.optim.swa_utils import AveragedModel, update_bn
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
-from .losses import accuracy
+from .losses import accuracy, CodistillationLoss
 from .viz import show_imgs
 
 
@@ -41,7 +41,7 @@ class Trainer():
     """
     def __init__(self, model, loss_fn, optimizer, scheduler=None, device='cpu',
                  name='trainer', n_print=1, n_plot=0, log=False,
-                 log_dir='./runs'):
+                 log_dir='./runs', rank=None, world_size=None):
         self.device = device
         self.model = model.to(self.device)
         self.optimizer = optimizer
@@ -52,6 +52,8 @@ class Trainer():
         self.name = name
         self.log = log
         self.log_dir = log_dir
+        self.rank = rank,
+        self.world_size = world_size
         if self.log:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             self.writer = SummaryWriter(f'{log_dir}/{self.name}_{timestamp}')
@@ -80,7 +82,6 @@ class Trainer():
         stopping_acc: float, optional
             Validation accuracy at which to stop training.
         """
-        self.in_burn_in = True
         self.in_codist = False
         self.in_swa = False
 
@@ -113,7 +114,7 @@ class Trainer():
         self._burn_in(epochs)
 
         # codistillation
-        self._codist(swa_epochs)
+        self._codist(codist_epochs)
 
         # stochastic weight averaging
         self._swa(swa_epochs)
@@ -142,11 +143,12 @@ class Trainer():
 
 
     def _codist(self, epochs):
-        pass
-
+        self.in_codist = True
+        self.loss_fn = CodistillationLoss(self.loss_fn, self.model,
+                                          self.device, self.rank, self.world_size)
 
     def _swa(self, epochs):
-        self.swa = True
+        self.in_swa = True
 
         # save the model at end of first phase and create the SWA model
         self.base_model = self.model
@@ -269,7 +271,10 @@ class Trainer():
 
         # calculate the loss & gradients
         output = self.model(image)
-        loss = self.loss_fn(output, target)
+        if self.in_codist:
+            loss = self.loss_fn(image, output, target)
+        else:
+            loss = self.loss_fn(output, target)
         loss.backward()
 
         # update the optimizer step
@@ -306,7 +311,10 @@ class Trainer():
             with torch.inference_mode():
                 image, target = image.to(self.device), target.to(self.device)
                 output = self.model(image)
-                loss = self.loss_fn(output, target)
+                if self.in_codist:
+                    loss = self.loss_fn(image, output, target)
+                else:
+                    loss = self.loss_fn(output, target)
                 valid_loss += loss.item()
                 valid_acc += accuracy(output, target).item()
                 mean_valid_loss = valid_loss / (batch_idx + 1)
