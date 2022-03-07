@@ -158,7 +158,7 @@ class Trainer():
         self.in_codist = True
 
         # remove DDP
-        self.model = self.model.module
+        self.model = self.model.module.to(self.device)
 
         # switch to codistillation loss
         self.loss_fn = CodistillationLoss(self.loss_fn, self.model,
@@ -178,7 +178,7 @@ class Trainer():
 
         # save the model at end of first phase and create the SWA model
         self.base_model = self.model
-        self.model = AveragedModel(self.base_model)
+        self.model = AveragedModel(self.base_model).to(self.device)
 
         # epoch loop
         for epoch in range(epochs):
