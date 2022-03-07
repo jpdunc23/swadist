@@ -5,6 +5,7 @@ Adapted from https://github.com/Yu-Group/adaptive-wavelets/blob/master/awave/uti
 from datetime import datetime
 import numpy as np
 import torch
+from torch.optim.swa_utils import AveragedModel, update_bn
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
 from .losses import accuracy
@@ -38,16 +39,8 @@ class Trainer():
     log_dir: str
 
     """
-    def __init__(self,
-                 model,
-                 loss_fn,
-                 optimizer,
-                 scheduler=None,
-                 device='cpu',
-                 name='trainer',
-                 n_print=1,
-                 n_plot=0,
-                 log=False,
+    def __init__(self, model, loss_fn, optimizer, scheduler=None, device='cpu',
+                 name='trainer', n_print=1, n_plot=0, log=False,
                  log_dir='./runs'):
         self.device = device
         self.model = model.to(self.device)
@@ -68,8 +61,9 @@ class Trainer():
         self.train(*args, **kwargs)
 
 
-    def train(self, train_loader, valid_loader=None, epochs=10, swa_epochs=0,
-              codistill=False, stopping_acc=np.inf, validations_per_epoch=None):
+    def train(self, train_loader, valid_loader=None,
+              epochs=10, codist_epochs=0, swa_epochs=0,
+              validations_per_epoch=None, stopping_acc=np.inf):
         """
         Trains the model.
 
@@ -78,7 +72,7 @@ class Trainer():
         train_loader: torch.utils.data.DataLoader
         valid_loader: torch.utils.data.DataLoader, optional
         epochs: int, optional
-            Number of epochs to train the model for.
+            Number of epochs to train the model (burn-in).
         swa_epochs: int, optional
             Number of additional epochs for stochastic weight averaging.
         codistill: bool, optional
@@ -86,77 +80,98 @@ class Trainer():
         stopping_acc: float, optional
             Validation accuracy at which to stop training.
         """
-        print("Starting {epochs}-epoch training loop...")
+        self.in_burn_in = True
+        self.in_codist = False
+        self.in_swa = False
 
-        self.train_epochs = epochs + swa_epochs
-        self.train_losses = np.empty(epochs + swa_epochs)
-        self.train_accs = np.empty(epochs + swa_epochs)
-        self.valid_losses = np.empty(epochs + swa_epochs)
-        self.valid_accs = np.empty(epochs + swa_epochs)
+        self.train_loader = train_loader
+        self.valid_loader = valid_loader
+        self.n_batches = len(self.train_loader)
 
-        for epoch in range(epochs + swa_epochs):
-            if epoch == epochs:
-                # save the model at end of first phase and create the SWA model
-                self.base_model = self.model
-                self.model = torch.optim.swa_utils.AveragedModel(self.base_model)
+        self.valid_freq = None
+        if self.valid_loader and validations_per_epoch:
+            if min(self.n_batches, validations_per_epoch) - 1 > 0:
+                self.valid_freq = int(np.floor(
+                    self.n_batches / validations_per_epoch
+                ))
 
-            # epoch loop
-            mean_epoch_loss, mean_epoch_acc = self._train_epoch(train_loader,
-                                                                epoch,
-                                                                valid_loader,
-                                                                validations_per_epoch)
-            self.train_losses[epoch] = mean_epoch_loss
-            self.train_accs[epoch] = mean_epoch_acc
+        self.stopping_acc = stopping_acc
+        self.early_stop = False
 
-            if epoch > epochs:
-                # update running average of parameters
-                self.model.update_parameters(self.model)
+        self.total_train_epochs = epochs + codist_epochs + swa_epochs
 
-            if valid_loader:
+        self.train_losses = np.empty(self.total_train_epochs)
+        self.train_accs = np.empty(self.total_train_epochs)
 
-                # update bn statistics before validation
-                if swa_epochs > 0:
-                    torch.optim.swa_utils.update_bn(train_loader, self.model)
+        self.valid_losses = np.empty(self.total_train_epochs)
+        self.valid_accs = np.empty(self.total_train_epochs)
 
-                # validate the epoch
-                mean_valid_loss, mean_valid_acc = self._validate(valid_loader, global_step=epoch)
-                self.valid_losses[epoch] = mean_valid_loss
-                self.valid_accs[epoch] = mean_valid_acc
 
-                if self.log:
-                    global_step = len(train_loader)*(epoch + 1)
-                    self.writer.add_scalar('Step loss/validation', mean_valid_loss, global_step)
-                    self.writer.add_scalar('Step accuracy/validation', mean_valid_acc, global_step)
+        print(f'Starting {epochs}-epoch training loop...')
 
-                # stop early?
-                if mean_valid_acc >= stopping_acc:
-                    print(f'Validation accuracy target reached. Stopping early after {epoch + 1} epochs'
-                          f' ({global_step} steps)')
-                    self.train_epochs = epoch + 1
-                    break
+        # vanilla SGD / burn-in
+        self._burn_in(epochs)
 
-            elif self.n_print > 0 and (epoch + 1) % self.n_print == 0:
-                print('\n')
+        # codistillation
+        self._codist(swa_epochs)
 
-            if self.scheduler:
-                self.scheduler.step()
-
-        # update bn statistics at the end of training if needed
-        if swa_epochs > 0 and not valid_loader:
-            torch.optim.swa_utils.update_bn(train_loader, self.model)
+        # stochastic weight averaging
+        self._swa(swa_epochs)
 
         if self.log:
             self.writer.close()
 
 
-    def _train_epoch(self, data_loader, epoch, valid_loader=None, n_valid=None):
+    def _check_for_early_stop(self, valid_acc, epoch, step):
+        if valid_acc >= self.stopping_acc:
+            print(f'Validation accuracy target reached. Stopping early after {epoch + 1} epochs'
+                  f' ({step} steps)')
+            self.total_train_epochs = epoch + 1
+            self.total_train_steps = step + 1
+            self.early_stop = True
+
+
+    def _burn_in(self, epochs):
+        # epoch loop
+        for epoch in range(epochs):
+
+            if self.early_stop:
+                break
+
+            self._train_epoch(epoch)
+
+
+    def _codist(self, epochs):
+        pass
+
+
+    def _swa(self, epochs):
+        self.swa = True
+
+        # save the model at end of first phase and create the SWA model
+        self.base_model = self.model
+        self.model = AveragedModel(self.base_model)
+
+        # epoch loop
+        for epoch in range(epochs):
+            # update running average of parameters
+            self.model.update_parameters(self.model)
+
+            if self.early_stop:
+                break
+
+            self._train_epoch(epoch)
+
+        # update bn stats at the end of training
+        update_bn(self.train_loader, self.model)
+
+
+    def _train_epoch(self, epoch):
         """
         Trains the model for one epoch.
 
         Parameters
         ----------
-        data_loader: torch.utils.data.DataLoader
-
         epoch: int
             Epoch number
 
@@ -167,19 +182,18 @@ class Trainer():
         self.model.train()
         epoch_loss = 0.
         epoch_acc = 0.
-        valid_freq = None
-
-        # calculate frequency of validation passes
-        if valid_loader and n_valid:
-            n_valid = min(len(data_loader), n_valid) - 1
-            if n_valid > 0:
-                valid_freq = int(np.floor(len(data_loader) / n_valid))
+        n_batches = self.n_batches
+        val_freq = self.valid_freq
 
         # training loop
-        for batch_idx, (image, target) in enumerate(data_loader):
-            step = epoch*len(data_loader) + batch_idx + 1
+        for batch_idx, (image, target) in enumerate(self.train_loader):
+            step = epoch*n_batches + batch_idx
             image, target = image.to(self.device), target.to(self.device)
+
             iter_loss, iter_acc = self._train_iteration(image, target)
+            # self.step_loss.append(iter_loss)
+            # self.step_acc.append(iter_acc)
+
             epoch_loss += iter_loss
             epoch_acc += iter_acc
 
@@ -188,33 +202,55 @@ class Trainer():
                 self.writer.add_scalar('Step accuracy/training', iter_acc, step)
 
             if self.n_print > 0 and (epoch + 1) % self.n_print == 0:
-                end = '' if batch_idx < len(data_loader) - 1 else '\n'
+                end = '' if batch_idx < n_batches - 1 else '\n'
                 print(
                     f'\rTrain epoch: {epoch + 1} -- '
                     f'Accuracy: {epoch_acc / (batch_idx + 1):.6f} -- '
                     f'Avg. loss ({self.loss_fn.__name__}): {epoch_loss / (batch_idx + 1):.6f} -- '
-                    f'Batch: {batch_idx + 1}/{len(data_loader)} '
-                    f'({100. * (batch_idx + 1) / len(data_loader):.0f}%) -- '
-                    f'Total steps: {step}',
+                    f'Batch: {batch_idx + 1}/{n_batches} '
+                    f'({100. * (batch_idx + 1) / n_batches:.0f}%) -- '
+                    f'Total steps: {step + 1}',
                     end=end
                 )
 
             # validate every valid_freq steps
-            if batch_idx < len(data_loader) - 1 and valid_freq and (batch_idx + 1) % valid_freq == 0:
-                _, _ = self._validate(valid_loader, step, epoch=False)
+            if batch_idx < n_batches - 1 and val_freq:
+                if (batch_idx + 1) % val_freq == 0:
+                    _, _ = self._validate(step, epoch=False)
 
         if self.n_plot > 0 and (epoch + 1) % self.n_plot == 0:
-            _ = self.plot_or_log_activations(data_loader, n_imgs=2, save_idxs=True,
-                                         epoch=epoch, log=self.log)
+            _ = self.plot_or_log_activations(self.train_loader, n_imgs=2, save_idxs=True,
+                                             epoch=epoch, log=self.log)
 
-        mean_epoch_loss = epoch_loss / len(data_loader)
-        mean_epoch_acc = epoch_acc / len(data_loader)
+        # calculate epoch training metrics
+        mean_epoch_loss = epoch_loss / n_batches
+        mean_epoch_acc = epoch_acc / n_batches
+        self.train_losses[epoch] = mean_epoch_loss
+        self.train_accs[epoch] = mean_epoch_acc
 
         if self.log:
             self.writer.add_scalar('Epoch loss/training', mean_epoch_loss, epoch)
             self.writer.add_scalar('Epoch accuracy/training', mean_epoch_acc, epoch)
 
-        return mean_epoch_loss, mean_epoch_acc
+        if self.valid_loader:
+            if self.in_swa:
+                # update bn statistics before validation
+                torch.optim.swa_utils.update_bn(self.train_loader, self.model)
+
+            # validate the epoch
+            mean_valid_loss, mean_valid_acc = self._validate(global_step=epoch)
+            self.valid_losses[epoch] = mean_valid_loss
+            self.valid_accs[epoch] = mean_valid_acc
+
+            # check if we should stop early
+            self._check_for_early_stop(mean_valid_acc, epoch, step)
+
+            if self.log:
+                self.writer.add_scalar('Step loss/validation', mean_valid_loss, step)
+                self.writer.add_scalar('Step accuracy/validation', mean_valid_acc, step)
+
+        if self.scheduler:
+            self.scheduler.step()
 
 
     def _train_iteration(self, image, target):
@@ -245,7 +281,7 @@ class Trainer():
         return loss.item(), acc.item()
 
 
-    def _validate(self, data_loader, global_step, epoch=True):
+    def _validate(self, global_step, epoch=True):
         """
         Validates the current model.
 
@@ -266,7 +302,7 @@ class Trainer():
         valid_acc = 0.
 
         # validation loop
-        for batch_idx, (image, target) in enumerate(data_loader):
+        for batch_idx, (image, target) in enumerate(self.valid_loader):
             with torch.inference_mode():
                 image, target = image.to(self.device), target.to(self.device)
                 output = self.model(image)
@@ -277,18 +313,18 @@ class Trainer():
                 mean_valid_acc = valid_acc / (batch_idx + 1)
 
                 if epoch and self.n_print > 0 and (global_step + 1) % self.n_print == 0:
-                    end = '' if batch_idx < len(data_loader) - 1 else '\n\n'
+                    end = '' if batch_idx < len(self.valid_loader) - 1 else '\n\n'
                     print(
                         f'\rValidation accuracy: {mean_valid_acc:.6f} -- '
                         f'Avg. loss ({self.loss_fn.__name__}): {mean_valid_loss:.6f} -- '
-                        f'Batch: {batch_idx + 1}/{len(data_loader)} '
-                        f'({100.*(batch_idx + 1) / len(data_loader):.0f}%)',
+                        f'Batch: {batch_idx + 1}/{len(self.valid_loader)} '
+                        f'({100.*(batch_idx + 1) / len(self.valid_loader):.0f}%)',
                         end=end
                     )
 
         # plot or log feature maps and filters
         if epoch and self.n_plot > 0 and (global_step + 1) % self.n_plot == 0:
-            _ = self.plot_or_log_activations(data_loader, n_imgs=2, save_idxs=True, epoch=global_step,
+            _ = self.plot_or_log_activations(self.valid_loader, n_imgs=2, save_idxs=True, epoch=global_step,
                                              stage='validation', log=self.log)
             _ = self.plot_or_log_filters(save_idxs=True, epoch=global_step, log=self.log)
 
@@ -300,7 +336,7 @@ class Trainer():
         return mean_valid_loss, mean_valid_acc
 
 
-    def plot_or_log_activations(self, data_loader, img_idx_dict=None, n_imgs=None, save_idxs=False,
+    def plot_or_log_activations(self, loader, img_idx_dict=None, n_imgs=None, save_idxs=False,
                                 epoch=None, stage='train', random=False, log=False):
         """
         img_idx_dict: dict
@@ -319,7 +355,7 @@ class Trainer():
                 new_idx_dict = True
                 img_idx_dict = {}
                 n_imgs = 1 if n_imgs is None else n_imgs
-                img_idxs = np.random.choice(len(data_loader.dataset), size=n_imgs, replace=False)
+                img_idxs = np.random.choice(len(loader.dataset), size=n_imgs, replace=False)
                 img_idxs.sort()
                 img_idx_dict['img_idxs'] = img_idxs
         else:
@@ -327,8 +363,8 @@ class Trainer():
 
         for i, img_idx in enumerate(img_idxs):
             imgs = []
-            image = data_loader.dataset[img_idx][0]
-            original = data_loader.dataset.inv_transform(image)
+            image = loader.dataset[img_idx][0]
+            original = loader.dataset.inv_transform(image)
             imgs.append(original)
             image = image[None, :]
 
