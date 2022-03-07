@@ -55,12 +55,13 @@ class Trainer():
         self.name = name
         self.log = log
         self.log_dir = log_dir
-        self.rank = rank,
+        self.rank = rank
         self.world_size = world_size
+        self.data_parallel = data_parallel
         if self.log:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             self.writer = SummaryWriter(f'{log_dir}/{name}_rank{rank}_{timestamp}')
-        if data_parallel:
+        if self.data_parallel:
             self.model = DistributedDataParallel(
                 model, device_ids=[rank], output_device=rank
             )
@@ -114,10 +115,10 @@ class Trainer():
         self.valid_losses = np.empty(self.total_train_epochs)
         self.valid_accs = np.empty(self.total_train_epochs)
 
-        if not data_parallel:
+        if not self.data_parallel:
             print(f'Starting {self.total_train_epochs}-epoch training loop...')
         else:
-            print(f'Worker {rank+1}/{world_size} starting {self.total_train_epochs}-epoch training loop...')
+            print(f'Worker {self.rank+1}/{self.world_size} starting {self.total_train_epochs}-epoch training loop...')
 
         self.can_print = self.n_print > 0 and self.rank == 0
 
@@ -413,7 +414,7 @@ class Trainer():
                     conv_idx = img_idx_dict[conv][i]
                 imgs.append(out[0, conv_idx, :, :][None, :, :])
 
-            if log and self.rank = 0:
+            if log and self.rank == 0:
                 self.writer.add_image(f'{stage}/{img_idx}_0_original', original, epoch)
                 for j, conv in enumerate(self.model.convs):
                     self.writer.add_image(f'{stage}/{img_idx}_{j+1}_{conv}', imgs[j+1], epoch)
