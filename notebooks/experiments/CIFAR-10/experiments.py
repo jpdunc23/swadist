@@ -37,7 +37,7 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # load training and validation data
-    train_loader, valid_loader = get_dataloaders('cifar10', rootdir=datadir,
+    train_loader, valid_loader = get_dataloaders('cifar10', root_dir=datadir,
                                                  test=False, batch_size=batch_size)
 
     # setup optimizer / lr sched
@@ -46,14 +46,16 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
                                 momentum=momentum, nesterov=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    trainer = Trainer(model, F.cross_entropy, optimizer, scheduler, log=True,
-                      log_dir=rundir, name=exper, device=rank, rank=rank,
-                      world_size=world_size)
+    trainer = Trainer(model, F.cross_entropy, optimizer, scheduler,
+                      log=True, log_dir=rundir, name=exper,
+                      device=rank, rank=rank, world_size=world_size,
+                      data_parallel=True)
 
     # train
     if exper == 'sgd':
         trainer.train(train_loader, valid_loader, epochs=epochs,
-                      stopping_acc=stopping_acc, validations_per_epoch=4)
+                      stopping_acc=stopping_acc,
+                      validations_per_epoch=4)
         n_epochs = trainer.total_train_epochs
 
 
