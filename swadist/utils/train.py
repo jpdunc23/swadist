@@ -41,7 +41,7 @@ class Trainer():
     """
     def __init__(self, model, loss_fn, optimizer, scheduler=None, device='cpu',
                  name='trainer', n_print=1, n_plot=0, log=False,
-                 log_dir='./runs', rank=None, world_size=None):
+                 log_dir='./runs', data_parallel=False, rank=None, world_size=None):
         self.device = device
         self.model = model.to(self.device)
         self.optimizer = optimizer
@@ -57,6 +57,11 @@ class Trainer():
         if self.log:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             self.writer = SummaryWriter(f'{log_dir}/{self.name}_{timestamp}')
+        if data_parallel:
+            self.serial_model = self.model
+            self.model = DistributedDataParallel(
+                model, device_ids=[rank], output_device=rank
+            )
 
 
     def __call__(self, *args, **kwargs):
@@ -143,8 +148,24 @@ class Trainer():
 
     def _codist(self, epochs):
         self.in_codist = True
+
+        # update the non-DDP model's parameters and remove DDP
+        self.model = self.serial_model.load_state_dict(
+            self.model.state_dict()
+        )
+
+        # switch to codistillation loss
         self.loss_fn = CodistillationLoss(self.loss_fn, self.model,
                                           self.device, self.rank, self.world_size)
+
+        # epoch loop
+        for epoch in range(epochs):
+
+            if self.early_stop:
+                break
+
+            self._train_epoch(epoch)
+
 
     def _swa(self, epochs):
         self.in_swa = True

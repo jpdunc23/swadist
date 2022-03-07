@@ -1,5 +1,6 @@
 import os
 import argparse
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn import functional as F
+from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel
 
 from swadist.data.loader import get_dataloaders
@@ -26,7 +28,6 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
     # pin process to a single device
     torch.cuda.set_device(rank)
     model = ResNet(in_kernel_size=3, stack_sizes=[1, 1, 1], n_classes=10, batch_norm=False).to(rank)
-    model = DistributedDataParallel(model, device_ids=[rank], output_device=rank).cuda(rank)
 
     # epochs, scaling epochs, decay factor
     epochs, T, alpha = 25, 20, 0.25
@@ -34,6 +35,8 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
     optimizer = torch.optim.SGD(model.parameters(), lr=lr0, momentum=momentum, nesterov=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    self.writer = SummaryWriter(f'{log_dir}/{exper}_{timestamp}')
     # load training and validation data
     train_loader, valid_loader = get_dataloaders('cifar10', rootdir=datadir, test=False, batch_size=batch_size)
 
@@ -43,10 +46,31 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
                                 momentum=momentum, nesterov=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    if exper == 'swadist':
-        trainer = Trainer(model, F.cross_entropy, optimizer, scheduler, log=True, log_dir=rundir, name=f'swadist', device=rank)
-        trainer.train(train_loader, valid_loader, epochs=epochs,
+    trainer = Trainer(model, F.cross_entropy, optimizer, scheduler, log=True,
+                      log_dir=rundir, name=exper, device=rank, rank=rank,
+                      world_size=world_size)
+
+    if exper == 'codist':
+        trainer.train(train_loader, valid_loader, epochs=5, codist_epochs=epochs-5,
                       stopping_acc=stopping_acc, validations_per_epoch=4)
+        n_epochs = trainer.total_train_epochs
+
+    elif exper == 'swadist':
+        trainer.train(train_loader, valid_loader, epochs=5, codist_epochs=epochs-10,
+                      swa_epochs=5, stopping_acc=stopping_acc,
+                      validations_per_epoch=4)
+
+    train_loss = trainer.train_losses[n_epochs]
+    valid_loss = trainer.valid_losses[n_epochs]
+    train_acc = trainer.train_accs[n_epochs]
+    valid_loss = trainer.valid_accs[n_epochs]
+    trainer.writer.add_hparams(
+        { 'lr': lr0, 'batch_size': batch_size, 'momentum': momentum,
+          'stopping_acc': stopping_acc, 'T': T, 'alpha': alpha },
+        {'hparam/train accuracy': train_acc , 'hparam/train loss': train_loss,
+         'hparam/valid accuracy': valid_acc, 'hparam/valid accuracy': valid_acc}
+    )
+    trainer.writer.close()
 
 
 if __name__ == "__main__":
@@ -64,10 +88,13 @@ if __name__ == "__main__":
     print(f'n GPUs: {world_size}')
 
     # batch_size
-    batch_size = [2**i for i in range(1, 14)]
+    # batch_size = [2**i for i in range(1, 14)]
+    batch_size = [2**i for i in range(6, 14)]
 
     # initial lr, scaling factor, momentum
+    # lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
     lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
+    # momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
     momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
 
     assert len(lr0) == len(batch_size), 'lr0 has the wrong size'
