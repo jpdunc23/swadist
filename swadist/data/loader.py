@@ -9,8 +9,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, Normalize, ToTensor
 
-def get_dataloaders(dataset='cifar10', root_dir='./data', download=False,
-                    validation_split=False, validation_prop=.1,
+def get_dataloaders(dataset='cifar10', root_dir='./data', download=True,
+                    validation=True, validation_prop=.1, test=True,
                     data_parallel=False, cuda=False, shuffle=True,
                     num_workers=1, pin_memory=True, batch_size=64, **kwargs):
     """A generic data loader
@@ -21,8 +21,12 @@ def get_dataloaders(dataset='cifar10', root_dir='./data', download=False,
         Name of the dataset to load.
     root_dir: str
         Path to the dataset root.
-    validation_split: bool
-        If True, the dataset will be loaded using a three-way split.
+    validation: bool
+        If True, load the validation set.
+    validation_prop: float
+        The proportion of the training set to use for validation.
+    test: bool
+        If True, load the test set.
     data_parallel: bool
         If True, use DistributedSampler.
     cuda: bool
@@ -30,51 +34,31 @@ def get_dataloaders(dataset='cifar10', root_dir='./data', download=False,
     kwargs:
         Additional arguments to `DataLoader`. Default values are modified.
     """
-    dataset_getters = {
-        'cifar10' : get_cifar10
+    data_getters = {
+        # should return tuple of (datasets, samplers)
+        'cifar10' : get_cifar10,
     }
-    datasets = dataset_getters[dataset](root_dir, download, validation_split)
-
+    datasets, samplers = data_getters[dataset](root_dir, download=download,
+                                               validation=validation,
+                                               validation_prop=validation_prop,
+                                               test=test)
     pin_memory = pin_memory and cuda # only pin if not using CPU
-    # sampler = DistributedSampler(dataset[0]) if data_parallel else None
-    # only shuffle if not using DistributedSampler
-    shuffle = shuffle and not (data_parallel or validation_split)
+    # samplers[0] = DistributedSampler(dataset[0]) if data_parallel else samplers[0]
 
-    if validation_split:
-        split = int(np.floor(len(datasets[0]) * (1 - validation_prop)))
-        indices = list(range(len(datasets[0])))
-        train_idx, valid_idx = indices[:split], indices[split:]
-        train_sampler = SubsetRandomSampler(train_idx)
-        valid_sampler = SubsetRandomSampler(valid_idx)
-        train_loader = DataLoader(datasets[0],
-                                  batch_size=batch_size,
-                                  sampler=train_sampler,
-                                  num_workers=num_workers,
-                                  pin_memory=pin_memory,
-                                  **kwargs)
-        valid_loader = DataLoader(datasets[1],
-                                  batch_size=batch_size,
-                                  sampler=valid_sampler,
-                                  num_workers=num_workers,
-                                  pin_memory=pin_memory,
-                                  **kwargs)
-        test_loader = DataLoader(datasets[2],
-                                 batch_size=batch_size,
-                                 shuffle=False,
-                                 num_workers=num_workers,
-                                 pin_memory=pin_memory,
-                                 **kwargs)
-        return train_loader, valid_loader, test_loader
-    loaders = [
-        DataLoader(datasets[i],
-                   batch_size=batch_size,
-                   shuffle=shuffle and i==0,
-                   # sampler=sampler,
-                   num_workers=num_workers,
-                   pin_memory=pin_memory,
-                   **kwargs)
-        for i, _ in enumerate(datasets)
-    ]
+    loaders = []
+    for i, dset in enumerate(datasets):
+        if dset is not None:
+            loaders.append(DataLoader(
+                dset,
+                batch_size=batch_size,
+                shuffle=shuffle and samplers[i] is None,
+                sampler=samplers[i],
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                **kwargs
+            ))
+    if len(loaders) == 1:
+        return loaders[0]
     return loaders
 
 
@@ -87,7 +71,9 @@ def per_channel_mean_and_std(dataset, max_val=255.):
     return mean, std
 
 
-def get_cifar10(root_dir='./data', download=False, validation_split=False):
+def get_cifar10(root_dir='./data', download=False,
+                validation=True, validation_prop=.1, test=True,
+                **kwargs):
 
     # download the training data if needed
     dataset = CIFAR10(root=root_dir, train=True, download=download)
@@ -102,8 +88,12 @@ def get_cifar10(root_dir='./data', download=False, validation_split=False):
         Normalize([0., 0., 0.], 1. / std),
         Normalize(-mean, [1., 1., 1.])
     ])
-
-    if validation_split:
+    if validation:
+        split = int(np.floor(len(dataset) * (1 - validation_prop)))
+        indices = list(range(len(dataset)))
+        train_idx, valid_idx = indices[:split], indices[split:]
+        train_sampler = SubsetRandomSampler(train_idx)
+        valid_sampler = SubsetRandomSampler(valid_idx)
         train_dataset = CIFAR10(
             root=root_dir, train=True,
             download=False, transform=transform,
@@ -120,14 +110,20 @@ def get_cifar10(root_dir='./data', download=False, validation_split=False):
             root=root_dir, train=True,
             download=False, transform=transform,
         )
+        train_sampler = None
+        valid_dataset = None
+        valid_sampler = None
 
     # download/load test data
-    test_dataset = CIFAR10(root=root_dir,
-                           train=False,
-                           transform=transform,
-                           download=download)
-    test_dataset.inv_transform = inv_transform
+    if test:
+        test_dataset = CIFAR10(root=root_dir,
+                               train=False,
+                               transform=transform,
+                               download=download)
+        test_dataset.inv_transform = inv_transform
+    else:
+        test_dataset = None
 
-    if validation_split:
-        return train_dataset, valid_dataset, test_dataset
-    return train_dataset, test_dataset
+    datasets = (train_dataset, valid_dataset, test_dataset)
+    samplers = (train_sampler, valid_sampler, None)
+    return datasets, samplers
