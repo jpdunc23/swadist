@@ -1,6 +1,8 @@
 """Loss functions and evaluation utilities
 """
 
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,6 +37,7 @@ class CodistillationLoss():
 
     def __init__(self, base_loss, base_model, device, rank, world_size,
                  sync_freq=50):
+        self.__name__ = 'CodistillationLoss'
         self.base_loss = base_loss
         self.device = device
         self.rank = rank
@@ -44,13 +47,13 @@ class CodistillationLoss():
         self.steps = 0
         for i in range(world_size):
             if i == self.rank:
-                replicas.append(base_model)
+                self.replicas.append(base_model)
             else:
-                replicas.append(copy.deepcopy(base_model))
+                self.replicas.append(deepcopy(base_model))
 
 
     def __call__(self, x, output, target):
-        if steps % self.sync_freq:
+        if self.steps % self.sync_freq:
             self.update_replicas()
 
         # update the step counter
@@ -62,34 +65,35 @@ class CodistillationLoss():
             for i, model in enumerate(self.replicas):
                 if i != self.rank:
                     avg_pred += model(x) / (self.world_size - 1)
+        avg_pred = torch.clone(avg_pred)
+        print(f'avg_pred: {avg_pred[0].numpy()}')
 
         return self.base_loss(output, target) + self.base_loss(output, avg_pred)
 
 
     def update_replicas(self):
-        with torch.inference_mode():
-            # construct the Tensor list to all_gather into
-            state_dicts = [m.state_dict() for m in self.replicas]
-            handles = []
-            for (key, param) in state_dicts[0].items():
-                # this is where the rest of group will send their params
-                recv_list = [torch.zeros(param.shape).to(self.device)
-                             for _ in self.world_size]
+        # construct the Tensor list to all_gather into
+        state_dicts = [m.state_dict() for m in self.replicas]
+        handles = []
+        for (key, param) in state_dicts[0].items():
+            # this is where the rest of group will send their params
+            recv_list = [torch.zeros(param.shape).to(self.device)
+                         for _ in range(self.world_size)]
 
-                # send my param to the rest of the group
-                handle = dist.all_gather(recv_list, param, async_op=True)
+            # send my param to the rest of the group
+            handle = dist.all_gather(recv_list, param, async_op=True)
 
-                # wait until the recv'd params are ready
-                h.wait()
+            # wait until the recv'd params are ready
+            handle.wait()
 
-                # update the replicas' state dicts
-                for i, new_param in enumerate(recv_list):
-                    if i != self.rank:
-                        state_dicts[i][key] = new_param
-
-            # load the new state dicts
-            for i, model in enumerate(self.replicas):
+            # update the replicas' state dicts
+            for i, new_param in enumerate(recv_list):
                 if i != self.rank:
-                    model.load_state_dict(state_dicts[i])
+                    state_dicts[i][key] = new_param
+
+        # load the new state dicts
+        for i, model in enumerate(self.replicas):
+            if i != self.rank:
+                model.load_state_dict(state_dicts[i])
 
 

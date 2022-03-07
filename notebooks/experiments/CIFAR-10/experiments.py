@@ -66,7 +66,7 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
 
 
     if exper == 'codist':
-        trainer.train(train_loader, valid_loader, epochs=5,
+        trainer.train(train_loader, valid_loader, epochs=2,
                       codist_epochs=epochs-5, stopping_acc=stopping_acc,
                       validations_per_epoch=4)
         n_epochs = trainer.total_train_epochs
