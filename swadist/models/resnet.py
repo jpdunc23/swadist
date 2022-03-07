@@ -7,9 +7,7 @@ Adapted from:
 import numpy as np
 import torch
 from torch import nn
-from torchvision.utils import make_grid
-from matplotlib import pyplot as plt
-from ..utils.viz import show_imgs
+
 
 __all__ = [
     "ResNet",
@@ -163,19 +161,19 @@ class ResNet(nn.Module):
         return x
 
 
-    def get_conv_imgs(self, w_idx_dict=None):
-        """Returns specified or random images of the convolutional filters.
+    def get_filters(self, w_idx_dict=None):
+        """Returns specified or random filters from each convolutional layer.
 
         Parameters
         ----------
 
         w_idx_dict: dict (optional)
-            Should entries like { 'layer1 conv1': [1,2,3,4] } for each of `self.convs`,
+            Has entries like { 'layer1 conv1': [1,2,3,4] } for each of `self.convs`,
             where the values are lists of ints with positive values no larger than the
             number of channels for the corresponding convolution module.
         """
         with torch.inference_mode():
-            imgs = []
+            filters = {}
             if w_idx_dict is None:
                 w_idx_dict = {}
             for conv in self.convs:
@@ -186,16 +184,17 @@ class ResNet(nn.Module):
                         i += 1
                         if i == 3:
                             break # ignore downsampling
-                        key = f'{conv} conv{i}'
-                        filters = m.weight.data.view(-1, 1, *m.kernel_size)
+                        key = f'{conv}/conv{i}'
+                        filts = m.weight.data.view(-1, 1, *m.kernel_size)
                         if key in w_idx_dict:
                             idxs = w_idx_dict[key]
                         else:
                             # get four random kernels
-                            idxs = np.random.choice(len(filters), size=4, replace=False)
+                            idxs = np.random.choice(len(filts), size=4, replace=False)
+                            idxs.sort()
                             w_idx_dict[key] = idxs
-                        imgs.append(make_grid(filters[idxs], nrow=2))
-            return imgs, w_idx_dict
+                        filters[key] = idxs, filts[idxs]
+            return filters, w_idx_dict
 
 
     def partial_forward(self, x, stop_module='layer1'):
