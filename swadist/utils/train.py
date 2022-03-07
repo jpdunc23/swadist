@@ -44,7 +44,7 @@ class Trainer():
     """
     def __init__(self, model, loss_fn, optimizer, scheduler=None, device='cpu',
                  name='trainer', n_print=1, n_plot=0, log=False,
-                 log_dir='./runs', data_parallel=False, rank=None, world_size=None):
+                 log_dir='./runs', data_parallel=False, rank=0, world_size=1):
         self.device = device
         self.model = model.to(self.device)
         self.optimizer = optimizer
@@ -59,7 +59,7 @@ class Trainer():
         self.world_size = world_size
         if self.log:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            self.writer = SummaryWriter(f'{log_dir}/{self.name}_{timestamp}')
+            self.writer = SummaryWriter(f'{log_dir}/{name}_rank{rank}_{timestamp}')
         if data_parallel:
             self.model = DistributedDataParallel(
                 model, device_ids=[rank], output_device=rank
@@ -114,7 +114,12 @@ class Trainer():
         self.valid_losses = np.empty(self.total_train_epochs)
         self.valid_accs = np.empty(self.total_train_epochs)
 
-        print(f'Starting {self.total_train_epochs}-epoch training loop...')
+        if not data_parallel:
+            print(f'Starting {self.total_train_epochs}-epoch training loop...')
+        else:
+            print(f'Worker {rank+1}/{world_size} starting {self.total_train_epochs}-epoch training loop...')
+
+        self.can_print = self.n_print > 0 and self.rank == 0
 
         # vanilla SGD / burn-in
         self._burn_in(epochs)
@@ -223,7 +228,7 @@ class Trainer():
                 self.writer.add_scalar('Step loss/training', iter_loss, step)
                 self.writer.add_scalar('Step accuracy/training', iter_acc, step)
 
-            if self.n_print > 0 and (epoch + 1) % self.n_print == 0:
+            if self.can_print and (epoch + 1) % self.n_print == 0:
                 end = '' if batch_idx < n_batches - 1 else '\n'
                 print(
                     f'\rTrain epoch: {epoch + 1} -- '
@@ -340,7 +345,7 @@ class Trainer():
                 mean_valid_loss = valid_loss / (batch_idx + 1)
                 mean_valid_acc = valid_acc / (batch_idx + 1)
 
-                if epoch and self.n_print > 0 and (global_step + 1) % self.n_print == 0:
+                if epoch and self.can_print and (global_step + 1) % self.n_print == 0:
                     end = '' if batch_idx < len(self.valid_loader) - 1 else '\n\n'
                     print(
                         f'\rValidation accuracy: {mean_valid_acc:.6f} -- '
@@ -408,7 +413,7 @@ class Trainer():
                     conv_idx = img_idx_dict[conv][i]
                 imgs.append(out[0, conv_idx, :, :][None, :, :])
 
-            if log:
+            if log and self.rank = 0:
                 self.writer.add_image(f'{stage}/{img_idx}_0_original', original, epoch)
                 for j, conv in enumerate(self.model.convs):
                     self.writer.add_image(f'{stage}/{img_idx}_{j+1}_{conv}', imgs[j+1], epoch)
@@ -437,7 +442,7 @@ class Trainer():
         else:
             filters, w_idx_dict = self.model.get_filters()
 
-        if log:
+        if log and self.rank == 0:
             for conv, (idxs, filter_group) in filters.items():
                 tag = f'{conv}/{idxs}'
                 self.writer.add_images(tag, filter_group, epoch)

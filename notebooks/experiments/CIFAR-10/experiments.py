@@ -17,6 +17,8 @@ from swadist.utils import Trainer, show_imgs
 from swadist.models.resnet import ResNet
 
 def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, stopping_acc=0.9):
+    if rank == 0:
+        print(f'{exper} experiment: batch_size={batch_size}, lr0={lr0:.6f}, momentum={momentum:.6f} ')
 
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '6006'
