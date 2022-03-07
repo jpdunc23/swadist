@@ -83,7 +83,7 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
     train_loss = trainer.train_losses[n_epochs]
     valid_loss = trainer.valid_losses[n_epochs]
     train_acc = trainer.train_accs[n_epochs]
-    valid_loss = trainer.valid_accs[n_epochs]
+    valid_acc = trainer.valid_accs[n_epochs]
     trainer.writer.add_hparams(
         { 'lr': lr0, 'batch_size': batch_size, 'momentum': momentum,
           'stopping_acc': stopping_acc, 'T': T, 'alpha': alpha },
