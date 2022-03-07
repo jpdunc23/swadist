@@ -107,7 +107,6 @@ class Trainer():
         self.valid_losses = np.empty(self.total_train_epochs)
         self.valid_accs = np.empty(self.total_train_epochs)
 
-
         print(f'Starting {epochs}-epoch training loop...')
 
         # vanilla SGD / burn-in

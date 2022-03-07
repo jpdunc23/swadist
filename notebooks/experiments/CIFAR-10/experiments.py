@@ -1,3 +1,4 @@
+import os
 import argparse
 
 import matplotlib.pyplot as plt
@@ -24,11 +25,8 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
 
     # pin process to a single device
     torch.cuda.set_device(rank)
-
-    model = DistributedDataParallel(
-        ResNet(in_kernel_size=3, stack_sizes=[1, 1, 1], n_classes=10, batch_norm=False),
-        device_ids=[rank], output_device=rank
-    ).cuda(rank)
+    model = ResNet(in_kernel_size=3, stack_sizes=[1, 1, 1], n_classes=10, batch_norm=False).to(rank)
+    model = DistributedDataParallel(model, device_ids=[rank], output_device=rank).cuda(rank)
 
     # epochs, scaling epochs, decay factor
     epochs, T, alpha = 25, 20, 0.25
@@ -36,9 +34,8 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
     optimizer = torch.optim.SGD(model.parameters(), lr=lr0, momentum=momentum, nesterov=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-
     # load training and validation data
-    train_loader, valid_loader = get_dataloader('cifar10', test=False, batch_size=batch_size)
+    train_loader, valid_loader = get_dataloaders('cifar10', rootdir=datadir, test=False, batch_size=batch_size)
 
     # setup optimizer / lr sched
     lr_lambda = lambda epoch: 1 - (1 - alpha)*epoch/T if epoch < T else (alpha if epoch < epochs else lr0)
@@ -46,11 +43,10 @@ def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, st
                                 momentum=momentum, nesterov=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # train SGD
     if exper == 'swadist':
-        trainer = Trainer(model, F.cross_entropy, optimizer, scheduler, log=True, name='sgd-train')
+        trainer = Trainer(model, F.cross_entropy, optimizer, scheduler, log=True, log_dir=rundir, name=f'swadist', device=rank)
         trainer.train(train_loader, valid_loader, epochs=epochs,
-                      stopping_acc=stopping_acc, validations_per_epoch=4, log=True)
+                      stopping_acc=stopping_acc, validations_per_epoch=4)
 
 
 if __name__ == "__main__":
