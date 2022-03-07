@@ -2,15 +2,17 @@
 Adapted from https://github.com/Yu-Group/adaptive-wavelets/blob/master/notebooks/cifar10/cifar10.py
 '''
 
-import torch
-import torchvision
+import numpy as np
 from torch.utils.data import DataLoader
+from torch.utils.data.sampler import SubsetRandomSampler
 from torch.utils.data.distributed import DistributedSampler
-
+from torchvision.datasets import CIFAR10
+from torchvision.transforms import Compose, Normalize, ToTensor
 
 def get_dataloaders(dataset='cifar10', root_dir='./data', download=False,
-                    validation_split=False, data_parallel=False, cuda=False,
-                    shuffle=True, num_workers=1, pin_memory=True, batch_size=64, **kwargs):
+                    validation_split=False, validation_prop=.1,
+                    data_parallel=False, cuda=False, shuffle=True,
+                    num_workers=1, pin_memory=True, batch_size=64, **kwargs):
     """A generic data loader
 
     Parameters
@@ -34,13 +36,40 @@ def get_dataloaders(dataset='cifar10', root_dir='./data', download=False,
     datasets = dataset_getters[dataset](root_dir, download, validation_split)
 
     pin_memory = pin_memory and cuda # only pin if not using CPU
-    sampler = DistributedSampler(dataset[0]) if data_parallel else None
-    shuffle = shuffle and not data_parallel # only shuffle if not using DistributedSampler
+    # sampler = DistributedSampler(dataset[0]) if data_parallel else None
+    # only shuffle if not using DistributedSampler
+    shuffle = shuffle and not (data_parallel or validation_split)
+
+    if validation_split:
+        split = int(np.floor(len(datasets[0]) * (1 - validation_prop)))
+        indices = list(range(len(datasets[0])))
+        train_idx, valid_idx = indices[:split], indices[split:]
+        train_sampler = SubsetRandomSampler(train_idx)
+        valid_sampler = SubsetRandomSampler(valid_idx)
+        train_loader = DataLoader(datasets[0],
+                                  batch_size=batch_size,
+                                  sampler=train_sampler,
+                                  num_workers=num_workers,
+                                  pin_memory=pin_memory,
+                                  **kwargs)
+        valid_loader = DataLoader(datasets[1],
+                                  batch_size=batch_size,
+                                  sampler=valid_sampler,
+                                  num_workers=num_workers,
+                                  pin_memory=pin_memory,
+                                  **kwargs)
+        test_loader = DataLoader(datasets[2],
+                                 batch_size=batch_size,
+                                 shuffle=False,
+                                 num_workers=num_workers,
+                                 pin_memory=pin_memory,
+                                 **kwargs)
+        return train_loader, valid_loader, test_loader
     loaders = [
         DataLoader(datasets[i],
                    batch_size=batch_size,
                    shuffle=shuffle and i==0,
-                   sampler=sampler,
+                   # sampler=sampler,
                    num_workers=num_workers,
                    pin_memory=pin_memory,
                    **kwargs)
@@ -61,42 +90,44 @@ def per_channel_mean_and_std(dataset, max_val=255.):
 def get_cifar10(root_dir='./data', download=False, validation_split=False):
 
     # download the training data if needed
-    dataset = torchvision.datasets.CIFAR10(root=root_dir,
-                                           train=True,
-                                           download=download)
+    dataset = CIFAR10(root=root_dir, train=True, download=download)
 
     # calculate mean / std of channels over the training data
     mean, std = per_channel_mean_and_std(dataset)
-    transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize(mean, std)
+    transform = Compose([
+        ToTensor(),
+        Normalize(mean, std)
     ])
-    inv_transform = torchvision.transforms.Compose([
-        torchvision.transforms.Normalize([0., 0., 0.], 1. / std),
-        torchvision.transforms.Normalize(-mean, [1., 1., 1.])
+    inv_transform = Compose([
+        Normalize([0., 0., 0.], 1. / std),
+        Normalize(-mean, [1., 1., 1.])
     ])
 
     if validation_split:
-        # hold out 10% for validation set
-        valid_dataset = dataset
-        valid_dataset.data = valid_dataset.data[45000:]
-        valid_dataset.transform = transform
-        valid_dataset.inv_transform = inv_transform
+        train_dataset = CIFAR10(
+            root=root_dir, train=True,
+            download=False, transform=transform,
+        )
+        train_dataset.inv_transform = inv_transform
 
-        # get the remaining training data
-        dataset = torchvision.datasets.CIFAR10(root=root_dir,
-                                               train=True,
-                                               transform=transform)
-        dataset.data = dataset.data[:45000]
-        dataset.inv_transform = inv_transform
+        valid_dataset = CIFAR10(
+            root=root_dir, train=True,
+            download=False, transform=transform,
+        )
+        valid_dataset.inv_transform = inv_transform
+    else:
+        train_dataset = CIFAR10(
+            root=root_dir, train=True,
+            download=False, transform=transform,
+        )
 
     # download/load test data
-    test_dataset = torchvision.datasets.CIFAR10(root=root_dir,
-                                                train=False,
-                                                transform=transform,
-                                                download=download)
+    test_dataset = CIFAR10(root=root_dir,
+                           train=False,
+                           transform=transform,
+                           download=download)
     test_dataset.inv_transform = inv_transform
 
     if validation_split:
-        return dataset, valid_dataset, test_dataset
-    return dataset, test_dataset
+        return train_dataset, valid_dataset, test_dataset
+    return train_dataset, test_dataset

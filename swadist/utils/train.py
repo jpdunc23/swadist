@@ -43,6 +43,7 @@ class Trainer():
                  loss_fn,
                  optimizer,
                  scheduler=None,
+                 codistill=False,
                  device='cpu',
                  name='trainer',
                  n_print=1,
