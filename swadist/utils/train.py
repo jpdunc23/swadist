@@ -7,7 +7,7 @@ from datetime import datetime
 import torch
 import numpy as np
 
-from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from torch.optim.swa_utils import AveragedModel, update_bn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
@@ -24,6 +24,10 @@ class Trainer():
     Parameters
     ----------
     model: torch.nn.Module
+
+    train_loader: torch.utils.data.DataLoader
+
+    valid_loader: torch.utils.data.DataLoader
 
     loss_fn: Union[Callable, torch.nn.modules.loss._Loss]
 
@@ -57,9 +61,12 @@ class Trainer():
     def __init__(self,
                  # training params
                  model,
-                 loss_fn=None,
-                 optimizer=None,
+                 train_loader,
+                 valid_loader,
+                 loss_fn,
+                 optimizer,
                  scheduler=None,
+                 swa_scheduler=None,
                  # compute params
                  rank=0,
                  device='cpu',
@@ -75,13 +82,16 @@ class Trainer():
 
         self.device = device
         self.model = model.to(self.device)
+        self.swa_model = None
+
+        self.train_loader = train_loader
+        self.valid_loader = valid_loader
+        self.n_batches = len(train_loader)
 
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.scheduler = scheduler
-
-        self.n_print = n_print
-        self.n_plot = n_plot
+        self.swa_scheduler = swa_scheduler
 
         self.rank = rank
         self.world_size = world_size
@@ -91,6 +101,10 @@ class Trainer():
                 model, device_ids=[rank], output_device=rank
             )
 
+        self.n_print = n_print
+        self.n_plot = n_plot
+        self.prints = self.n_print > 0 and self.rank == 0
+
         self.name = name
         if log_ranks is None:
             log_ranks = [self.rank]
@@ -98,14 +112,30 @@ class Trainer():
             self.log = log and self.rank in log_ranks
         self.log_dir = log_dir
 
+        # set during training
+        self.in_codist = None
+        self.in_swa = None
+        self.val_freq = None
+        self.stopping_acc = None
+        self.stop_early = None
+        self.train_loss = None
+        self.valid_loss = None
+        self.train_acc = None
+        self.valid_acc = None
+        self.step_train_loss = None
+        self.step_valid_loss = None
+        self.step_train_acc = None
+        self.step_valid_acc = None
+        self.step = None
+        self.epoch = None
+        self.writer = None
+
 
     def __call__(self, *args, **kwargs):
         self.train(*args, **kwargs)
 
 
     def train(self,
-              train_loader,
-              valid_loader,
               epochs=10,
               epochs_codist=0,
               epochs_swa=0,
@@ -116,8 +146,6 @@ class Trainer():
 
         Parameters
         ----------
-        train_loader: torch.utils.data.DataLoader
-        valid_loader: torch.utils.data.DataLoader, optional
         epochs: int, optional
             Number of epochs to train the model (burn-in).
         epochs_swa: int, optional
@@ -129,10 +157,6 @@ class Trainer():
         """
         self.in_codist = False
         self.in_swa = False
-
-        self.train_loader = train_loader
-        self.valid_loader = valid_loader
-        self.n_batches = len(self.train_loader)
 
         self.val_freq = None
 
@@ -196,8 +220,6 @@ class Trainer():
             print(f'Worker {self.rank+1}/{self.world_size} starting '
                   f'{max_epochs}-epoch training loop...\n')
 
-        self.prints = self.n_print > 0 and self.rank == 0
-
         # vanilla SGD / burn-in
         if epochs > 0:
             self._burn_in(epochs)
@@ -257,19 +279,19 @@ class Trainer():
     def _swa(self, epochs):
         self.in_swa = True
 
-        # save the model at end of first phase and create the SWA model
-        self.base_model = self.model
-        self.model = AveragedModel(self.base_model).to(self.device)
+        # create the model for SWA
+        self.swa_model = AveragedModel(self.model).to(self.device)
 
         # epoch loop
         for _ in range(self.epoch, self.epoch + epochs):
-            # update running average of parameters
-            self.model.update_parameters(self.model)
 
             if self.stop_early:
                 break
 
             self._train_epoch()
+
+        # update bn statistics at end of training
+        update_bn(self.train_loader, self.swa_model, self.device)
 
         self._log_hparam_metrics()
 
@@ -339,14 +361,13 @@ class Trainer():
         self.train_loss = loss / self.n_batches
         self.train_acc = acc / self.n_batches
 
-        if self.in_swa:
-            # update bn statistics before validation
-            torch.optim.swa_utils.update_bn(self.train_loader, self.model)
-
         # validate the epoch, which logs metrics
         self._validate()
 
-        if self.scheduler:
+        if self.in_swa and self.swa_scheduler:
+            # update running average of parameters
+            self.swa_scheduler.step()
+        elif self.scheduler:
             self.scheduler.step()
 
 
@@ -372,7 +393,6 @@ class Trainer():
             loss = self.loss_fn(output, target)
         loss.backward()
 
-        # update the optimizer step
         self.optimizer.step()
 
         # calculate accuracy
@@ -389,24 +409,32 @@ class Trainer():
         ----------
         data_loader: torch.utils.data.DataLoader
 
-        epoch_val: bool
-            If True, this validation is at the end of an epoch. Otherwise it's a step validation.
+        step_type: str
+            Either 'epoch' or 'step'.
 
         Return
         ------
         mean_valid_loss: float
         """
-        self.model.eval()
         loss = 0.
         acc = 0.
         epoch_val = step_type == 'epoch'
         step = self.epoch if epoch_val else self.step
 
+        if epoch_val and self.in_swa:
+            # update the AveragedModel at the end of every epoch
+            self.swa_model.update_parameters(self.model)
+
+        self.model.eval()
+
         # validation loop
         for batch_idx, (image, target) in enumerate(self.valid_loader):
             with torch.inference_mode():
                 image, target = image.to(self.device), target.to(self.device)
-                output = self.model(image)
+                if self.in_swa:
+                    output = self.swa_model(image)
+                else:
+                    output = self.model(image)
                 if self.in_codist:
                     loss += self.loss_fn(image, output, target).item()
                 else:
