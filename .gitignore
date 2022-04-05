@@ -159,4 +159,4 @@ cython_debug/
 runs/
 
 # experiment data
-notebooks/experiments/*/data
+experiments/*/data
