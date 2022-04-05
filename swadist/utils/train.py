@@ -19,7 +19,7 @@ from .viz import show_imgs
 
 class Trainer():
     """
-    Class to handle training of model.
+    Class to handle training of SWADist.
 
     Parameters
     ----------
@@ -113,6 +113,7 @@ class Trainer():
         self.log_dir = log_dir
 
         # set during training
+        self.hparam_dict = None
         self.in_codist = None
         self.in_swa = None
         self.val_freq = None
@@ -122,6 +123,10 @@ class Trainer():
         self.valid_loss = None
         self.train_acc = None
         self.valid_acc = None
+        self.train_losses = None
+        self.valid_losses = None
+        self.train_accs = None
+        self.valid_accs = None
         self.step_train_loss = None
         self.step_valid_loss = None
         self.step_train_acc = None
@@ -169,8 +174,12 @@ class Trainer():
 
         self.train_loss = np.inf
         self.valid_loss = np.inf
+        self.train_losses = []
+        self.valid_losses = []
         self.train_acc = 0.0
         self.valid_acc = 0.0
+        self.train_accs = []
+        self.valid_accs = []
 
         self.step_train_loss = np.inf
         self.step_valid_loss = np.inf
@@ -180,35 +189,36 @@ class Trainer():
         self.step = 0
         self.epoch = 0
 
+        # save hyperparameters
+        hparam_dict = {
+            'batch_size': self.train_loader.batch_size,
+            'epochs': epochs,
+            'epochs_codist': epochs_codist,
+            'epochs_swa': epochs_swa
+        }
+
+        # simplified hparams for filename
+        hparam_str = '_'.join([f'{k}={v}' for k, v in hparam_dict.items()])
+
+        # add the rest of the hyperparams
+        hparam_dict['optimizer'] = type(self.optimizer).__name__
+        hparam_dict.update(self.optimizer.defaults)
+
+        if self.scheduler is not None:
+            hparam_dict['scheduler'] = type(self.scheduler).__name__
+
+        if isinstance(self.scheduler, LinearPolyLR):
+            hparam_dict['alpha'] = self.scheduler.alpha
+            hparam_dict['decay_epochs'] = self.scheduler.alpha
+
+        self.hparam_dict = hparam_dict
+
+        # setup logging
         if self.log and self.rank == 0:
-
-            # setup logging
-
-            hparam_dict = {
-                'batch_size': self.train_loader.batch_size,
-                'epochs': epochs,
-                'epochs_codist': epochs_codist,
-                'epochs_swa': epochs_swa
-            }
-
-            # simplified hparams for filename
-            hparam_str = '_'.join([f'{k}={v}' for k, v in hparam_dict.items()])
-
-            # add the rest of the hyperparams
-            hparam_dict['optimizer'] = type(self.optimizer).__name__
-            hparam_dict.update(self.optimizer.defaults)
-
-            if self.scheduler is not None:
-                hparam_dict['scheduler'] = type(self.scheduler).__name__
-
-            if isinstance(self.scheduler, LinearPolyLR):
-                hparam_dict['alpha'] = self.scheduler.alpha
-                hparam_dict['decay_epochs'] = self.scheduler.alpha
-
-            self.hparam_dict = hparam_dict
 
             # create the writer
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
             self.writer = SummaryWriter(
                 f'{self.log_dir}/{self.name}_{timestamp}_rank={self.rank}_{hparam_str}'
             )
@@ -360,6 +370,8 @@ class Trainer():
         # calculate epoch training metrics
         self.train_loss = loss / self.n_batches
         self.train_acc = acc / self.n_batches
+        self.train_losses.append(self.train_loss)
+        self.train_accs.append(self.train_acc)
 
         # validate the epoch, which logs metrics
         self._validate()
@@ -456,6 +468,8 @@ class Trainer():
         if epoch_val:
             self.valid_loss = step_valid_loss
             self.valid_acc = step_valid_acc
+            self.valid_losses.append(step_valid_loss)
+            self.valid_accs.append(step_valid_acc)
         else:
             self.step_valid_loss = step_valid_loss
             self.step_valid_acc = step_valid_acc
