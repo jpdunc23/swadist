@@ -1,8 +1,10 @@
-'''ResNet
+"""ResNet
 Adapted from:
  - https://d2l.ai/chapter_convolutional-modern/resnet.html
  - https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py
-'''
+"""
+
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -72,21 +74,22 @@ class ResNet(nn.Module):
     """
     Parameters
     ----------
-    in_channels: int
+    in_channels: int, optional
         Number of input channels.
-    in_kernel_size: int
+    in_kernel_size: int, optional
         Size of the kernel for the input in the first convolutional layer.
-    stack_sizes: List[int]
+    stack_sizes: List[int], optional
         The number of residual blocks in each group of layers where feature map sizes stay constant.
         The default gives ResNet-18 (or ResNet-14 when `in_kernel_size` is 3).
-    n_classes: int
+    n_classes: int, optional
         The number of output classes.
-    batch_norm: bool
+    batch_norm: bool, optional
         If True, uses batch normalization at the end of each convolutional layer.
     """
     def __init__(self, in_channels=3, in_kernel_size=7, stack_sizes=None,
                  n_classes=1000, batch_norm=True):
         super().__init__()
+
         if stack_sizes is None:
             stack_sizes = [2, 2, 2, 2]
         if in_kernel_size not in [3, 7]:
@@ -96,7 +99,8 @@ class ResNet(nn.Module):
         else:
             base_channels = 16
         self.convs = ['layer1', 'stack1', 'stack2', 'stack3']
-        self.layer1 = self._resnet_first_layer(in_channels, base_channels, in_kernel_size)
+        self.layer1 = self._resnet_first_layer(in_channels, base_channels, in_kernel_size,
+                                               batch_norm)
         self.stack1 = self._resnet_stack(base_channels, base_channels, stack_sizes[0],
                                          batch_norm, first_stack=True)
         self.stack2 = self._resnet_stack(base_channels, base_channels*2, stack_sizes[1],
@@ -117,12 +121,17 @@ class ResNet(nn.Module):
             nn.Linear(out_channels, n_classes)
         )
 
+        self.reinitialize_parameters()
+
+
+    def reinitialize_parameters(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+
 
 
     def _resnet_first_layer(self, in_channels, out_channels, kernel_size=7, batch_norm=True):
