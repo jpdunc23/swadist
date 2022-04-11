@@ -33,63 +33,67 @@ def accuracy(output, target, topk=(1,)):
 
 
 class CodistillationLoss():
-
-
-    def __init__(self, base_loss, base_model, device, rank, world_size,
+    def __init__(self,
+                 loss_fn,
+                 model,
+                 device,
+                 rank,
+                 world_size,
                  sync_freq=50):
         self.__name__ = 'CodistillationLoss'
-        self.base_loss = base_loss
+        self.loss_fn = loss_fn
         self.device = device
         self.rank = rank
         self.world_size = world_size
         self.replicas = []
         self.sync_freq = sync_freq
-        self.steps = 0
+        self.step = 0
+
         for i in range(world_size):
             if i == self.rank:
-                self.replicas.append(base_model)
+                self.replicas.append(model)
             else:
-                self.replicas.append(deepcopy(base_model))
+                self.replicas.append(deepcopy(model))
 
 
-    def __call__(self, x, output, target):
-        if self.steps % self.sync_freq:
+    def __call__(self, x, output):
+
+        if self.step % self.sync_freq == 0:
             self.update_replicas()
 
-        # update the step counter
-        self.steps += 1
+            # update the step counter
+        self.step += 1
 
         # get avg. predictions from the other models
-        with torch.inference_mode():
-            avg_pred = torch.zeros(output.shape).to(self.device)
+        # with torch.no_grad():
+        with torch.no_grad():
+            # average over other ranks
+            avg_output = torch.zeros(output.shape).to(self.device)
             for i, model in enumerate(self.replicas):
                 if i != self.rank:
-                    avg_pred += model(x) / (self.world_size - 1)
-        avg_pred = torch.clone(avg_pred)
-        print(f'avg_pred: {avg_pred[0].numpy()}')
+                    avg_output += model(x) / (self.world_size - 1)
+            avg_output = avg_output.softmax(dim=1)
 
-        return self.base_loss(output, target) + self.base_loss(output, avg_pred)
+        return self.loss_fn(output, avg_output)
 
 
     def update_replicas(self):
+
         # construct the Tensor list to all_gather into
         state_dicts = [m.state_dict() for m in self.replicas]
         handles = []
-        for (key, param) in state_dicts[0].items():
+        for key, param in state_dicts[0].items():
             # this is where the rest of group will send their params
             recv_list = [torch.zeros(param.shape).to(self.device)
                          for _ in range(self.world_size)]
 
             # send my param to the rest of the group
-            handle = dist.all_gather(recv_list, param, async_op=True)
+            dist.all_gather(recv_list, param)
 
-            # wait until the recv'd params are ready
-            handle.wait()
-
-            # update the replicas' state dicts
+            # update the replica state dicts
             for i, new_param in enumerate(recv_list):
                 if i != self.rank:
-                    state_dicts[i][key] = new_param
+                    state_dicts[i][key] = new_param.detach()
 
         # load the new state dicts
         for i, model in enumerate(self.replicas):
