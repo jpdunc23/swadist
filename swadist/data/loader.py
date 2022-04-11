@@ -3,16 +3,24 @@ Adapted from https://github.com/Yu-Group/adaptive-wavelets/blob/master/notebooks
 '''
 
 import numpy as np
-from torch.utils.data import DataLoader
-from torch.utils.data.sampler import SubsetRandomSampler
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data import RandomSampler, SubsetRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, Normalize, ToTensor
 
-def get_dataloaders(dataset='cifar10', root_dir='./data', download=True,
-                    validation=True, validation_prop=.1, test=True,
-                    data_parallel=False, cuda=False, shuffle=True,
-                    num_workers=1, pin_memory=True, batch_size=64, **kwargs):
+
+def get_dataloaders(dataset='cifar10',
+                    root_dir='./data',
+                    download=True,
+                    validation=True,
+                    test=False,
+                    split_training=False,
+                    world_size=1,
+                    rank=0,
+                    data_parallel=False,
+                    getter_kwargs=None,
+                    **kwargs):
     """A generic data loader
 
     Parameters
@@ -23,42 +31,67 @@ def get_dataloaders(dataset='cifar10', root_dir='./data', download=True,
         Path to the dataset root.
     validation: bool
         If True, load the validation set.
-    validation_prop: float
-        The proportion of the training set to use for validation.
     test: bool
         If True, load the test set.
-    data_parallel: bool
-        If True, use DistributedSampler.
-    cuda: bool
-        If True, using cuda.
+    split_training: bool
+        If True, use `torch.utils.data.SubsetRandomSampler`. Must be False if
+        `data_parallel` is True.
+    data_parallel:
+        If True, use `torch.utils.data.distributed.DistributedSampler`. Must be False if
+        `split_training` is True.
+    getter_kwargs: dict
+        Additional keyword arguments to pass to `DataLoader`. Default values are modified.
     kwargs:
-        Additional arguments to `DataLoader`. Default values are modified.
+        Additional keyword arguments to `DataLoader`. Should not include 'sampler'.
     """
+
+    if data_parallel and split_training:
+        raise ValueError('Only one of split_training and data_parallel can be True')
+
     data_getters = {
-        # should return tuple of (datasets, samplers)
+        # should return a list of datasets
         'cifar10' : get_cifar10,
     }
-    datasets, samplers = data_getters[dataset](root_dir, download=download,
-                                               validation=validation,
-                                               validation_prop=validation_prop,
-                                               test=test)
-    pin_memory = pin_memory and cuda # only pin if not using CPU
-    samplers[0] = DistributedSampler(datasets[0]) if data_parallel else samplers[0]
+
+    if getter_kwargs is None:
+        getter_kwargs = {}
+
+    getter_kwargs.update({
+        'root_dir': root_dir,
+        'download': download,
+        'validation': validation,
+        'test': test
+    })
+
+    datasets = data_getters[dataset](**getter_kwargs)
+
+    # create training data sampler
+    train_sampler = None
+    if split_training:
+        indices = np.array_split(np.arange(len(datasets[0])), world_size)
+        train_sampler = SubsetRandomSampler(indices[rank])
+        print(f'Using SubsetRandomSampler with samples '
+              f'{min(indices[rank])} to {max(indices[rank])}')
+    elif data_parallel:
+        train_sampler = DistributedSampler(datasets[0])
+        print(f'Using DistributedSampler')
+    else:
+        train_sampler = RandomSampler(datasets[0])
+        print(f'Using RandomSampler')
 
     loaders = []
     for i, dset in enumerate(datasets):
-        if dset is not None:
-            loaders.append(DataLoader(
-                dset,
-                batch_size=batch_size,
-                shuffle=shuffle and samplers[i] is None,
-                sampler=samplers[i],
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                **kwargs
-            ))
+        loaders.append(
+            DataLoader(dset,
+                       sampler=None if i != 0 else train_sampler,
+                       **kwargs)
+        )
+
+    print(f'Number of training batches: {len(loaders[0])}')
+
     if len(loaders) == 1:
         return loaders[0]
+
     return loaders
 
 
@@ -71,48 +104,56 @@ def per_channel_mean_and_std(dataset, max_val=255.):
     return mean, std
 
 
-def get_cifar10(root_dir='./data', download=False,
-                validation=True, validation_prop=.1, test=True,
+def get_cifar10(root_dir='./data',
+                download=False,
+                validation=True,
+                validation_prop=0.1,
+                test=True,
                 **kwargs):
+    datasets = []
 
     # download the training data if needed
     dataset = CIFAR10(root=root_dir, train=True, download=download)
 
     # calculate mean / std of channels over the training data
     mean, std = per_channel_mean_and_std(dataset)
+
     transform = Compose([
         ToTensor(),
         Normalize(mean, std)
     ])
+
     inv_transform = Compose([
         Normalize([0., 0., 0.], 1. / std),
         Normalize(-mean, [1., 1., 1.])
     ])
+
     if validation:
         split = int(np.floor(len(dataset) * (1 - validation_prop)))
         indices = list(range(len(dataset)))
         train_idx, valid_idx = indices[:split], indices[split:]
-        train_sampler = SubsetRandomSampler(train_idx)
-        valid_sampler = SubsetRandomSampler(valid_idx)
-        train_dataset = CIFAR10(
-            root=root_dir, train=True,
-            download=False, transform=transform,
-        )
-        train_dataset.inv_transform = inv_transform
-
-        valid_dataset = CIFAR10(
-            root=root_dir, train=True,
-            download=False, transform=transform,
+        valid_dataset = Subset(
+            dataset=CIFAR10(root=root_dir,
+                            train=True,
+                            transform=transform,
+                            download=False),
+            indices=valid_idx
         )
         valid_dataset.inv_transform = inv_transform
+        datasets.append(valid_dataset)
     else:
-        train_dataset = CIFAR10(
-            root=root_dir, train=True,
-            download=False, transform=transform,
-        )
-        train_sampler = None
-        valid_dataset = None
-        valid_sampler = None
+        train_idx = list(range(len(dataset)))
+
+    train_dataset = Subset(
+        dataset=CIFAR10(root=root_dir,
+                        train=True,
+                        transform=transform,
+                        download=False),
+        indices=train_idx
+    )
+    train_dataset.inv_transform = inv_transform
+
+    datasets = [train_dataset] + datasets
 
     # download/load test data
     if test:
@@ -121,9 +162,6 @@ def get_cifar10(root_dir='./data', download=False,
                                transform=transform,
                                download=download)
         test_dataset.inv_transform = inv_transform
-    else:
-        test_dataset = None
+        datasets.append(test_dataset)
 
-    datasets = [train_dataset, valid_dataset, test_dataset]
-    samplers = [train_sampler, valid_sampler, None]
-    return datasets, samplers
+    return datasets
