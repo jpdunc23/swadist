@@ -33,33 +33,33 @@ class Trainer():
     Parameters
     ----------
     model: torch.nn.Module
-
+        Model to train.
     train_loader: torch.utils.data.DataLoader
-
+        Training set `DataLoader`.
     valid_loader: torch.utils.data.DataLoader
-
+        Validation set `DataLoader`.
     loss_fn: Union[Callable, torch.nn.modules.loss._Loss]
-
+        Differentiable loss function.
     optimizer: torch.optim.Optimizer
-
-    scheduler: torch.optim.lr_scheduler._LRScheduler
-
-    name: str
-        Name for this Trainer.
+        Optimizer.
+    scheduler: torch.optim.lr_scheduler._LRScheduler, optional
+        Learning rate scheduler for SGD phase.
+    swa_scheduler: Union[torch.optim.lr_scheduler._LRScheduler, dict], optional
+        Either a scheduler or a dictionary of keyword arguments to pass to `SWALR`.
+    rank: int
+        The index of the current worker, from `0` to `world_size - 1`.
     device: torch.device, optional
         Device on which to run the code.
     world_size: int
         The number of distributed workers. If greater than 1, then .
-    rank: int
-        The index of the current worker, from `0` to `world_size - 1`.
+    name: str
+        Name for this Trainer.
     log: bool
         If True, write metrics and plots to a `torch.utils.tensorboard.SummaryWriter`.
     log_dir: str
         Directory to use for SummaryWriter output and saving the model.
-    save: bool
-        If True, save the final model, optimizer, and scheduler states along with hyperparameters.
     save_dir: str
-        Directory to use for SummaryWriter output and saving the model.
+        Directory to use for saving the model after each training run.
     n_print: int
         How often to print training / validation metrics, in number of steps.
     n_plot: int
@@ -174,6 +174,11 @@ class Trainer():
             one validation at the end of each epoch.
         stopping_acc: float, optional
             Validation accuracy at which to stop training.
+        save: bool
+            If True, save the final model, optimizer, and scheduler states along with hyperparameters.
+        save_dir: str
+            Directory to use for saving the model.
+
         """
         if epochs_codist > 0:
             assert not self.ddp, \
