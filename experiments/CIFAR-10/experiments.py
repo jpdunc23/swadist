@@ -1,3 +1,10 @@
+"""Run experiments for CIFAR-10.
+
+WARNING: out of date
+TODO: replace main() with spawn_fn
+
+"""
+
 import os
 import argparse
 from datetime import datetime
@@ -113,7 +120,7 @@ if __name__ == "__main__":
 
     # initial lr, scaling factor, momentum
     # lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
-    lr0 = 2**np.array([-5., -5., -5., -6., -5, -7, -4, -6])
+    lr0 = 2**np.array([-5., -5., -5., -6., -5., -7., -4., -6.])
     # momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
     momentum = [.95, .97, .975, .98, .975, .98, .97, .975]
 

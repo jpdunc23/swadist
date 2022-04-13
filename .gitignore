@@ -158,5 +158,8 @@ cython_debug/
 # tensorboard
 runs/
 
-# experiment data
+# downloaded data
 experiments/*/data
+
+# model artifacts
+experiments/*/state_dicts
