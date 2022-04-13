@@ -43,7 +43,7 @@ class CodistillationLoss():
                  device,
                  rank,
                  world_size,
-                 sync_freq=50):
+                 sync_freq=100):
         self.__name__ = 'CodistillationLoss'
         self.loss_fn = loss_fn
         self.device = device
@@ -76,7 +76,7 @@ class CodistillationLoss():
             for i, model in enumerate(self.replicas):
                 if i != self.rank:
                     avg_output += model(x) / (self.world_size - 1)
-            avg_output = avg_output.softmax(dim=1)
+            avg_output = avg_output.argmax(dim=1)
 
         return self.loss_fn(output, avg_output)
 
