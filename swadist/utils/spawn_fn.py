@@ -9,10 +9,13 @@ from torch.optim.swa_utils import SWALR
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel
 
-from swadist.models.resnet import ResNet
-from swadist.data.loader import get_dataloaders
-from .train import Trainer
-from .scheduler import LinearPolyLR
+from ..data import get_dataloaders
+from ..train import Trainer
+from ..optim import LinearPolyLR
+from ..models import ResNet
+
+
+__all__ = ['spawn_fn']
 
 
 def spawn_fn(rank: int,

@@ -3,6 +3,7 @@
 
 from torch.optim.lr_scheduler import LambdaLR
 
+
 class LinearPolyLR(LambdaLR):
     """Simple wrapper for LambdaLR with a linear (polynomial) decay schedule. Subtracts an
     increasing portion of the initial learning rate `lr0` (weighted by `alpha`) until reaching

@@ -1,4 +1,4 @@
-"""Training utilities
+"""Trainer
 Adapted from https://github.com/Yu-Group/adaptive-wavelets/blob/master/awave/utils/train.py
 """
 
@@ -11,15 +11,19 @@ from datetime import datetime
 import torch
 import numpy as np
 
-from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
+from torchvision.utils import make_grid
 from torch.optim.swa_utils import AveragedModel, update_bn
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.utils import make_grid
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
+
 import torch.distributed as dist
 
-from .losses import accuracy, CodistillationLoss
-from .scheduler import LinearPolyLR
 from .viz import show_imgs
+from .optim import LinearPolyLR
+from .metrics import accuracy, CodistillationLoss
+
+
+__all__ = ['Trainer']
 
 
 class Trainer():
@@ -623,6 +627,7 @@ class Trainer():
             )
 
 
+    # MAY NOT BE WORKING
     def plot_or_log_activations(self, loader, img_idx_dict=None, n_imgs=None, save_idxs=False,
                                 epoch=None, stage='train', random=False):
         """
@@ -684,7 +689,7 @@ class Trainer():
 
         return img_idx_dict
 
-
+    # MAY NOT BE WORKING
     def plot_or_log_filters(self, w_idx_dict=None, save_idxs=False,
                             epoch=None, random=False):
         self.model.eval()

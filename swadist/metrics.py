@@ -1,4 +1,4 @@
-"""Loss functions and evaluation utilities
+"""Loss functions and non-grad evaluation metrics.
 """
 
 from copy import deepcopy
@@ -7,6 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+
+
+__all__ = ['accuracy',
+           'CodistillationLoss']
 
 
 def accuracy(output, target, topk=(1,)):
