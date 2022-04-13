@@ -12,7 +12,7 @@ import torch
 import numpy as np
 
 from torchvision.utils import make_grid
-from torch.optim.swa_utils import AveragedModel, update_bn
+from torch.optim.swa_utils import AveragedModel, update_bn, SWALR
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 
@@ -86,6 +86,9 @@ class Trainer():
                  save_dir='./state_dicts',
                  n_print=1,
                  n_plot=0):
+
+        print('Param preview:')
+        print(next(model.parameters())[0], '\n')
 
         self.device = device
         self.model = model.to(self.device)
@@ -191,8 +194,6 @@ class Trainer():
         self.stopping_acc = stopping_acc
         self.stop_early = False
 
-        self.train_loss = np.inf
-        self.valid_loss = np.inf
         self.train_losses = []
         self.valid_losses = []
         self.train_accs = []
@@ -218,16 +219,22 @@ class Trainer():
             hparams_dict['scheduler'] = type(self.scheduler).__name__
 
             if isinstance(self.scheduler, LinearPolyLR):
-                hparams_dict['alpha'] = self.scheduler.alpha
-                hparams_dict['decay_epochs'] = self.scheduler.alpha
+                hparams_dict['scheduler_alpha'] = self.scheduler.alpha
+                hparams_dict['scheduler_decay_epochs'] = self.scheduler.alpha
 
-        if self.swa_scheduler is not None:
-            hparams_dict['scheduler'] = type(self.scheduler).__name__
+        if epochs_swa > 0 and self.swa_scheduler is not None:
 
-            if isinstance(self.swa_scheduler, torch.optim.swa_utils.SWALR):
-                hparams_dict['swa_lr'] = self.swa_scheduler.optimizer.param_groups[0]['swa_lr']
-                hparams_dict['swa_anneal_epochs'] = self.swa_scheduler.anneal_epochs
-                hparams_dict['swa_anneal_func'] = self.swa_scheduler.anneal_func.__name__
+            if isinstance(self.swa_scheduler, dict):
+                hparams_dict['swa_scheduler'] = 'SWALR'
+                for key, val in self.swa_scheduler.items():
+                    hparams_dict[f'swa_scheduler_{key}'] = val
+
+            else:
+                hparams_dict['swa_scheduler'] = type(self.swa_scheduler).__name__
+                if isinstance(self.swa_scheduler, SWALR):
+                    hparams_dict['swa_scheduler_swa_lr'] = self.swa_scheduler.optimizer.param_groups[0]['swa_lr']
+                    hparams_dict['swa_scheduler_anneal_epochs'] = self.swa_scheduler.anneal_epochs
+                    hparams_dict['swa_scheduler_anneal_strategy'] = self.swa_scheduler.anneal_func.__name__
 
         self.hparams_dict = hparams_dict
 
@@ -241,10 +248,12 @@ class Trainer():
 
         total_epochs = epochs_sgd + epochs_codist + epochs_swa
         if not self.world_size > 1:
-            print(f'Starting {total_epochs}-epoch training loop...\n')
+            print(f'Starting {total_epochs}-epoch training loop...')
+            print(f'Random seed: {torch.seed()}\n')
         else:
             print(f'Worker {self.rank+1}/{self.world_size} starting '
-                  f'{total_epochs}-epoch training loop...\n')
+                  f'{total_epochs}-epoch training loop...')
+            print(f'Random seed on rank {self.rank}: {torch.seed()}\n')
 
         if self.prints:
             print(f'SGD epochs: {epochs_sgd} | '
@@ -255,7 +264,7 @@ class Trainer():
 
         # vanilla SGD / burn-in
         if epochs_sgd > 0:
-            self._burn_in(epochs_sgd)
+            self._sgd(epochs_sgd)
 
         # codistillation
         if not self.stop_early and epochs_codist > 0:
@@ -302,7 +311,7 @@ class Trainer():
                 self.final_model = deepcopy(self.model)
 
 
-    def _burn_in(self, epochs):
+    def _sgd(self, epochs):
         # epoch loop
         for _ in range(epochs):
 
@@ -341,7 +350,14 @@ class Trainer():
             print(f'Starting SWA phase...\n')
 
         # create the model for SWA
+        # TODO: may want to store other model on cpu when not in use
         self.swa_model = AveragedModel(self.model)
+
+        if isinstance(self.swa_scheduler, dict):
+            self.swa_scheduler = SWALR(self.optimizer, **self.swa_scheduler)
+
+        # if self.swalr_kwargs is not None:
+        #     self.swa_scheduler = SWALR(self.optimizer, **self.swalr_kwargs)
 
         # epoch loop
         for _ in range(self.epoch, self.epoch + epochs):
@@ -350,9 +366,6 @@ class Trainer():
                 break
 
             self._train_epoch()
-
-        # update bn statistics at end of training
-        update_bn(self.train_loader, self.swa_model, self.device)
 
 
     def _train_epoch(self):
@@ -441,10 +454,10 @@ class Trainer():
         # validate the epoch, which logs metrics
         self._validate()
 
-        if self.in_swa and self.swa_scheduler:
+        if self.in_swa and self.swa_scheduler is not None:
             # update running average of parameters
             self.swa_scheduler.step()
-        elif self.scheduler:
+        elif self.scheduler is not None:
             self.scheduler.step()
 
 
@@ -460,7 +473,7 @@ class Trainer():
             A batch of corresponding labels.
         """
         # clear gradients
-        self.model.zero_grad()
+        self.optimizer.zero_grad()
 
         # calculate the loss & gradients
         output = self.model(image)
@@ -478,6 +491,7 @@ class Trainer():
         # calculate accuracy
         acc = accuracy(output, target)
 
+        # TODO: inspect codist contribution to loss
         return loss_.item(), acc.item()
 
 
@@ -497,9 +511,10 @@ class Trainer():
         epoch_val = step_type == 'epoch'
         step = self.epoch if epoch_val else self.step
 
-        if epoch_val and self.in_swa:
-            # update the AveragedModel at the end of every epoch
+        if self.in_swa:
+            # update the AveragedModel and batchnorm stats before every eval
             self.swa_model.update_parameters(self.model)
+            update_bn(self.train_loader, self.swa_model, self.device)
 
         self.model.eval()
 

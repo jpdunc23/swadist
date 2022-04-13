@@ -3,6 +3,7 @@ Adapted from https://github.com/Yu-Group/adaptive-wavelets/blob/master/notebooks
 '''
 
 import numpy as np
+
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data import RandomSampler, SubsetRandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -16,7 +17,7 @@ __all__ = ['get_dataloaders']
 """Dictionary of data getters defined in `.data`. Each of the functions in this
 dict should be able to accept the parameters 'root_dir', 'download',
 'validation', and 'test' and should return a dict of datasets with keys among
-'train', 'validation', and 'test'.
+'train' (required), 'validation', and 'test'.
 
 """
 _data_getters = {
@@ -24,9 +25,10 @@ _data_getters = {
 }
 
 
-def get_dataloaders(dataset='cifar10',
+def get_dataloaders(dataset,
+                    batch_size,
                     root_dir='./data',
-                    download=True,
+                    download=False,
                     validation=True,
                     test=False,
                     split_training=False,
@@ -41,6 +43,8 @@ def get_dataloaders(dataset='cifar10',
     ----------
     dataset: str
         Name of the dataset to load.
+    batch_size: int
+        Passed to `DataLoader`.
     root_dir: str
         Path to the dataset root.
     validation: bool
@@ -55,8 +59,9 @@ def get_dataloaders(dataset='cifar10',
         `split_training` is True.
     getter_kwargs: dict
         Additional keyword arguments to pass to data getter function. Default values are modified.
-    kwargs:
-        Additional keyword arguments to `DataLoader`. Should not include 'sampler'.
+    **kwargs:
+        Additional keyword arguments to `DataLoader`. If `sampler` is included, then
+        `split_training` and `data_parallel` should be False.
     """
 
     if data_parallel and split_training:
@@ -76,29 +81,34 @@ def get_dataloaders(dataset='cifar10',
     datasets = _data_getters[dataset](**getter_kwargs)
 
     # create training data sampler
-    train_sampler = None
+    train_sampler = kwargs.get('sampler', None)
+
     if split_training:
         indices = np.array_split(np.arange(len(datasets['train'])), world_size)
         train_sampler = SubsetRandomSampler(indices[rank])
         print(f'Using SubsetRandomSampler with samples '
               f'{min(indices[rank])} to {max(indices[rank])}')
+
     elif data_parallel:
         train_sampler = DistributedSampler(datasets['train'])
         print(f'Using DistributedSampler')
-    else:
+
+    elif train_sampler is None:
         train_sampler = RandomSampler(datasets['train'])
         print(f'Using RandomSampler')
 
     loaders = {}
+
     for name, dset in datasets.items():
         loaders[name] = DataLoader(
             dset,
+            batch_size=batch_size,
             sampler=None if name != 'train' else train_sampler,
             **kwargs
         )
 
-    if 'train' in loaders.keys():
-        print(f'Number of training batches: {len(loaders["train"])}')
+    print(f'Number of training samples: {len(datasets["train"])}')
+    print(f'Number of training batches: {len(loaders["train"])}\n')
 
     # convert loaders to sorted list
     loaders = [loaders[k] for k in ['train', 'validation', 'test'] if k in loaders.keys()]

@@ -27,6 +27,7 @@ def spawn_fn(rank: int,
              train_kwargs: dict,
              scheduler_kwargs: dict=None,
              swa_scheduler_kwargs: dict=None,
+             seed: int=None,
              addr: str='127.0.0.1',
              port: str='6016',
              backend: str=None):
@@ -53,6 +54,8 @@ def spawn_fn(rank: int,
         Keyword arguments to pass to `LinearPolyLR`.
     swa_scheduler_kwargs: dict, optional
         Keyword arguments to pass to `torch.optim.swa_utils.SWALR`.
+    seed: int, optional
+        Added to `rank` and passed to `torch.manual_seed`.
     addr, port, backend: str, optional
         Used to setup the process group.
 
@@ -75,7 +78,11 @@ def spawn_fn(rank: int,
     else:
         device = 'cpu'
 
-    print(f'Rank {rank} using {device} with random seed {torch.seed()}')
+    print(f'Rank {rank} joined process group on device {device}')
+
+    if seed is not None:
+        torch.manual_seed(seed + rank)
+        print(f'Rank {rank} using seed {seed + rank}')
 
     # get_dataloaders
     dataloader_kwargs.setdefault('world_size', world_size)
@@ -104,15 +111,6 @@ def spawn_fn(rank: int,
     else:
         scheduler = None
 
-    # SWA scheduler
-    if swa_scheduler_kwargs is not None:
-        swa_scheduler_kwargs['optimizer'] = optimizer
-        swa_scheduler_kwargs.setdefault('anneal_strategy', 'linear')
-        swa_scheduler_kwargs.setdefault('anneal_epochs', 0)
-        swa_scheduler = SWALR(**swa_scheduler_kwargs)
-    else:
-        swa_scheduler = None
-
     # Trainer
     trainer_kwargs['model'] = model
     trainer_kwargs['train_loader'] = train_loader
@@ -120,7 +118,7 @@ def spawn_fn(rank: int,
     trainer_kwargs['loss_fn'] = F.cross_entropy
     trainer_kwargs['optimizer'] = optimizer
     trainer_kwargs['scheduler'] = scheduler
-    trainer_kwargs['swa_scheduler'] = swa_scheduler
+    trainer_kwargs['swa_scheduler'] = swa_scheduler_kwargs
     trainer_kwargs['rank'] = rank
     trainer_kwargs['device'] = device
     trainer_kwargs['world_size'] = world_size
