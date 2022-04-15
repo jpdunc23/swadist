@@ -9,11 +9,6 @@ from torch.optim.swa_utils import SWALR
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel
 
-from ..data import get_dataloaders
-from ..train import Trainer
-from ..optim import LinearPolyLR
-from ..models import ResNet
-
 
 __all__ = ['spawn_fn']
 
@@ -61,6 +56,11 @@ def spawn_fn(rank: int,
 
     """
 
+    from ..data import get_dataloaders
+    from ..train import Trainer
+    from ..optim import LinearPolyLR
+    from ..models import ResNet
+
     cuda = torch.cuda.is_available()
 
     # initialize the process group
@@ -78,11 +78,11 @@ def spawn_fn(rank: int,
     else:
         device = 'cpu'
 
-    print(f'Rank {rank} joined process group on device {device}')
+    print(f'Rank {rank}: joined process group on device {device}')
 
     if seed is not None:
         torch.manual_seed(seed + rank)
-        print(f'Rank {rank} using seed {seed + rank}')
+        print(f'Rank {rank}: torch.manual_seed({seed + rank})')
 
     # get_dataloaders
     dataloader_kwargs.setdefault('world_size', world_size)
@@ -93,11 +93,15 @@ def spawn_fn(rank: int,
 
     data_parallel = dataloader_kwargs.get('data_parallel', False)
 
+    if seed is not None and cuda:
+        torch.cuda.manual_seed(seed + rank + 1)
+        print(f'Rank {rank}: torch.cuda.manual_seed({seed + world_size + rank})')
+
     # model
-    model = ResNet(**model_kwargs).to(device)
+    model = ResNet(**model_kwargs, device=device)
     if cuda and data_parallel and not train_kwargs.get('epochs_codist', 0) > 0:
         # codistillation is incompatible with DDP
-        print('Rank {rank} using DistributedDataParallel')
+        print(f'Rank {rank}: using DistributedDataParallel')
         model = DistributedDataParallel(model)
 
     # optimizer
@@ -126,5 +130,5 @@ def spawn_fn(rank: int,
     trainer = Trainer(**trainer_kwargs)
 
     # start training
-    train_kwargs.setdefault('save', True)
+    train_kwargs.setdefault('save', False)
     trainer.train(**train_kwargs)

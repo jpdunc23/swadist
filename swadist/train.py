@@ -11,16 +11,16 @@ from datetime import datetime
 import torch
 import numpy as np
 
+from torch.nn.utils import parameters_to_vector
 from torchvision.utils import make_grid
 from torch.optim.swa_utils import AveragedModel, update_bn, SWALR
-from torch.utils.tensorboard import SummaryWriter
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
-
-import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
 
 from .viz import show_imgs
 from .optim import LinearPolyLR
 from .metrics import accuracy, CodistillationLoss
+from .distributed import all_gather, is_multiproc
 
 
 __all__ = ['Trainer']
@@ -84,17 +84,14 @@ class Trainer():
                  log=False,
                  log_dir='./runs',
                  save_dir='./state_dicts',
-                 n_print=1,
+                 n_print=10,
                  n_plot=0):
-
-        print('Param preview:')
-        print(next(model.parameters())[0], '\n')
 
         self.device = device
         self.model = model.to(self.device)
         self.swa_model = None
         self.final_model = None
-        self.ddp = hasattr(self.model, 'module')
+        self.ddp = model.__class__.__name__ == 'DistributedDataParallel'
 
         self.train_loader = train_loader
         self.valid_loader = valid_loader
@@ -118,6 +115,7 @@ class Trainer():
         self.log_dir = log_dir
 
         self.save_dir = save_dir
+        self.train_id = None
 
         # set during training
         self.hparams_dict = None
@@ -183,8 +181,9 @@ class Trainer():
         if epochs_codist > 0:
             assert not self.ddp, \
                 'Codistillation is incompatible with DistributedDataParallel models.'
-            assert self.world_size > 1, \
-                "When using codistillation, world_size should be greater than 1."
+            assert is_multiproc(), \
+                ('To run codistillation, use multiprocessing with world_size greater than 1 ',
+                 '(see swadist.utils.spawn_fn).')
 
         self.in_codist = False
         self.in_swa = False
@@ -244,7 +243,7 @@ class Trainer():
         self.hparams_dict = hparams_dict
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        train_id = f'{self.name}_{timestamp}'
+        self.train_id = f'{self.name}_{timestamp}'
 
         # setup logging
         if self.logs:
@@ -252,13 +251,12 @@ class Trainer():
             self.writer = SummaryWriter(f'{self.log_dir}/{train_id}')
 
         total_epochs = epochs_sgd + epochs_codist + epochs_swa
-        if not self.world_size > 1:
+        if not is_multiproc():
             print(f'Starting {total_epochs}-epoch training loop...')
             print(f'Random seed: {torch.seed()}\n')
         else:
             print(f'Worker {self.rank+1}/{self.world_size} starting '
                   f'{total_epochs}-epoch training loop...')
-            print(f'Random seed on rank {self.rank}: {torch.seed()}\n')
 
         if self.prints:
             print(f'SGD epochs: {epochs_sgd} | '
@@ -266,6 +264,8 @@ class Trainer():
                   f'SWA epochs: {epochs_swa}')
             print(f'DistributedDataParallel: {self.ddp}')
             print(f'Stopping accuracy: {self.stopping_acc}\n')
+            # print('Param preview:')
+            # print(next(model.parameters())[0], '\n')
 
         # vanilla SGD / burn-in
         if epochs_sgd > 0:
@@ -286,11 +286,7 @@ class Trainer():
         self.model = None
 
         if save:
-            if save_dir is None:
-                save_dir = self.save_dir
-            if self.world_size > 1:
-                train_id = train_id + f'rank{self.rank}'
-            self.save(f=os.path.join(save_dir, f'{train_id}.pt'))
+            self.save(save_dir=save_dir)
 
         if self.logs:
             self._log_hparam_metrics()
@@ -301,19 +297,19 @@ class Trainer():
         if self.stopping_acc is not None and valid_acc >= self.stopping_acc:
 
             # in distributed mode, check if all ranks have reached stopping acc
-            if self.world_size > 1 and dist.is_initialized():
-                stop_early = [torch.Tensor([rank == self.rank]).to(self.device)
-                              for rank in range(self.world_size)]
-                dist.all_gather(stop_early, stop_early[self.rank])
-                stop_early = [t.cpu().item() for t in stop_early]
-                self.stop_early = np.all(stop_early)
+            if is_multiproc():
+                stop_early = all_gather(torch.asarray(True, device=self.device),
+                                        rank=self.rank,
+                                        world_size=self.world_size)
+                self.stop_early = parameters_to_vector(stop_early).all().cpu().item()
 
             if self.stop_early:
                 if self.prints:
-                    print('Validation accuracy target reached after {self.step} steps. '
-                          'Saving current model and stopping after epoch {self.epoch}.')
+                    print(f'Validation accuracy target reached after {self.step} steps. '
+                          f'Caching current model and stopping after epoch {self.epoch}.')
                     self.prints = False
-                self.final_model = deepcopy(self.model)
+                self.final_model = deepcopy(self.model.cpu())
+                self.model.to(self.device)
 
 
     def _sgd(self, epochs):
@@ -412,11 +408,11 @@ class Trainer():
             step_train_loss = loss / (batch_idx + 1)
             step_train_acc = acc / (batch_idx + 1)
 
-            if self.prints and (
-                    batch_idx % self.n_print == 0 or
-                    batch_idx == self.n_batches - 1
-            ):
-                end = '' if batch_idx < self.n_batches - 1 else '\n'
+            train_end = batch_idx == self.n_batches - 1
+
+            if self.prints and (batch_idx % self.n_print == 0 or train_end):
+
+                end = '\n' if train_end else ''
                 print(
                     f'\rTrain epoch: {self.epoch} -- '
                     f'Accuracy: {step_train_acc:.6f} -- '
@@ -515,6 +511,8 @@ class Trainer():
         acc = 0.
         epoch_val = step_type == 'epoch'
         step = self.epoch if epoch_val else self.step
+        prints = epoch_val and self.prints
+        n_batches = len(self.valid_loader)
 
         if self.in_swa:
             # update the AveragedModel and batchnorm stats before every eval
@@ -539,18 +537,43 @@ class Trainer():
                 step_valid_loss = loss / (batch_idx + 1)
                 step_valid_acc = acc / (batch_idx + 1)
 
-                if epoch_val and self.prints and (
-                    batch_idx % self.n_print == 0 or
-                    batch_idx == self.n_batches - 1
-                ):
-                    end = '' if batch_idx < len(self.valid_loader) - 1 else '\n\n'
-                    print(
-                        f'\rValidation accuracy: {step_valid_acc:.6f} -- '
-                        f'Avg. loss ({self.loss_fn.__name__}): {step_valid_loss:.6f} -- '
-                        f'Batch: {batch_idx + 1}/{len(self.valid_loader)} '
-                        f'({100.*(batch_idx + 1) / len(self.valid_loader):.0f}%)',
-                        end=end
-                    )
+                # final validation batch?
+                val_end = batch_idx == (n_batches - 1)
+                metrics = [('\r', step_valid_acc, step_valid_loss)]
+
+                if self.n_print > 0 and (val_end or (batch_idx % self.n_print) == 0):
+
+                    end = '\n' if val_end else ''
+
+                    if val_end and is_multiproc():
+
+                        if prints:
+                            print('\r', end='')
+
+                        # gather all ranks' metrics at end of validation
+                        metrics = all_gather(torch.asarray(metrics[0][1:], device=self.device),
+                                             rank=self.rank,
+                                             world_size=self.world_size)
+
+                        for i, arr in enumerate(metrics):
+                            arr.cpu()
+                            metrics[i] = (f'Rank {i} | ',
+                                          arr[0].item(), # rank i acc
+                                          arr[1].item()) # rank i loss
+
+                    if prints:
+                        # only print on rank 0
+                        for (begin, step_acc, step_loss) in metrics:
+                            print(
+                                f'{begin}Validation accuracy: {step_acc:.6f} | '
+                                f'Avg. loss ({self.loss_fn.__name__}): {step_loss:.6f} | '
+                                f'Batch: {batch_idx + 1}/{n_batches} '
+                                f'({100.*(batch_idx + 1) / n_batches:.0f}%)',
+                                end=end
+                            )
+
+        if prints:
+            print()
 
         if epoch_val:
             # save epoch loss and acc
@@ -738,13 +761,28 @@ class Trainer():
         return w_idx_dict
 
 
-    def save(self, f=None, **kwargs):
+    def save(self,
+             save_path=None, # only if save_dir is None
+             save_dir=None, # only if save_path is None
+             **kwargs):
+
+        assert save_path is None or save_dir is None, \
+            'save_path and save_dir both given which is ambiguous'
+
+        if save_path is None:
+
+            if save_dir is None:
+                save_dir = self.save_dir
+
+            if is_multiproc():
+                train_id = self.train_id + f'rank{self.rank}'
+
+            save_path = os.path.join(save_dir, f'{train_id}.pt')
+
+        if self.prints:
+            print(f'Saving final model to {save_path}')
 
         assert self.final_model is not None, 'Call Trainer.train before attempting to save'
-
-        if f is None:
-            f = os.path.join(self.save_dir,
-                             f'{self.name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pt')
 
         model = self.final_model.module if self.ddp else self.final_model
 
@@ -764,4 +802,4 @@ class Trainer():
         if self.swa_scheduler is not None:
             save_dict['swa_scheduler_state_dict'] = self.swa_scheduler.state_dict()
 
-        torch.save(save_dict, f, **kwargs)
+        torch.save(save_dict, save_path, **kwargs)

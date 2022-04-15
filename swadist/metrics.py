@@ -6,7 +6,10 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
+
+from torch.nn.utils import vector_to_parameters
+
+from .distributed import all_gather
 
 
 __all__ = ['accuracy',
@@ -84,24 +87,14 @@ class CodistillationLoss():
     def update_replicas(self):
 
         # construct the Tensor list to all_gather into
-        state_dicts = [m.state_dict() for m in self.replicas]
-        handles = []
-        for key, param in state_dicts[0].items():
-            # this is where the rest of group will send their params
-            recv_list = [torch.zeros(param.shape).to(self.device)
-                         for _ in range(self.world_size)]
+        params = self.replicas[self.rank].parameters()
 
-            # send my param to the rest of the group
-            dist.all_gather(recv_list, param)
+        # flat_params_list[i] is a single Tensor with all params from rank i
+        flat_params_list = all_gather(*params,
+                                      rank=self.rank,
+                                      world_size=self.world_size)
 
-            # update the replica state dicts
-            for i, new_param in enumerate(recv_list):
-                if i != self.rank:
-                    state_dicts[i][key] = new_param.detach()
-
-        # load the new state dicts
-        for i, model in enumerate(self.replicas):
+        # update the replicas' parameters
+        for i, flat_params in enumerate(flat_params_list):
             if i != self.rank:
-                model.load_state_dict(state_dicts[i])
-
-
+                vector_to_parameters(flat_params, self.replicas[i].parameters())
