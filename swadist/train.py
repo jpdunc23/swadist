@@ -39,19 +39,20 @@ class Trainer():
     valid_loader: torch.utils.data.DataLoader
         Validation set `DataLoader`.
     loss_fn: Union[Callable, torch.nn.modules.loss._Loss]
-        Differentiable loss function.
+        Differentiable loss function. Should use reduction='mean'.
     optimizer: torch.optim.Optimizer
         Optimizer.
     scheduler: torch.optim.lr_scheduler._LRScheduler, optional
         Learning rate scheduler for SGD phase.
     swa_scheduler: Union[torch.optim.lr_scheduler._LRScheduler, dict], optional
         Either a scheduler or a dictionary of keyword arguments to pass to `SWALR`.
-    rank: int
-        The index of the current worker, from `0` to `world_size - 1`.
     device: torch.device, optional
         Device on which to run the code.
+    rank: int
+        The index of the current worker, from `0` to `world_size - 1`.
     world_size: int
-        The number of distributed workers. If greater than 1, then .
+        The number of distributed workers. If greater than 1, then Trainer should be part of a
+        distributed process group.
     name: str
         Name for this Trainer.
     log: bool
@@ -76,8 +77,8 @@ class Trainer():
                  scheduler=None,
                  swa_scheduler=None,
                  # compute params
-                 rank=0,
                  device='cpu',
+                 rank=0,
                  world_size=1,
                  # logging / saving params
                  name='trainer',
@@ -150,6 +151,7 @@ class Trainer():
               epochs_codist: int=0,
               epochs_swa: int=0,
               swadist: bool=False,
+              codist_kwargs: dict=None,
               validate_per_epoch: int=None,
               stopping_acc: float=None,
               save: bool=False,
@@ -167,23 +169,42 @@ class Trainer():
             Number of epochs using stochastic weight averaging.
         swadist: bool, optional
             If True, use codistillation during the SWA phase. (NOT IMPLEMENTED)
+        codist_kwargs: dict, optional
+            Additional keyword arguments to pass to `CodistillationLoss` initializer.
         validate_per_epoch: int, optional
             Number of model evaluations on the validation data per epoch. There is always at least
             one validation at the end of each epoch.
         stopping_acc: float, optional
             Validation accuracy at which to stop training.
         save: bool
-            If True, save the final model, optimizer, and scheduler states along with hyperparameters.
+            If True, save the final model, optimizer, and scheduler states and hyperparameters.
         save_dir: str
             Directory to use for saving the model.
 
         """
+        # save hyperparameters
+        hparams_dict = {
+            'world_size': self.world_size,
+            'batch_size': self.train_loader.batch_size,
+            'epochs_sgd': epochs_sgd,
+            'epochs_codist': epochs_codist,
+            'epochs_swa': epochs_swa,
+            'optimizer': type(self.optimizer).__name__,
+            'loss_fn': self.loss_fn.__name__,
+        }
+
         if epochs_codist > 0:
             assert not self.ddp, \
                 'Codistillation is incompatible with DistributedDataParallel models.'
             assert is_multiproc(), \
                 ('To run codistillation, use multiprocessing with world_size greater than 1 ',
                  '(see swadist.utils.spawn_fn).')
+
+            if codist_kwargs is None:
+                codist_kwargs = {}
+
+            hparams_dict['codist_sync_freq'] = codist_kwargs.get('sync_freq', 50)
+            hparams_dict['codist_loss_fn'] = codist_kwargs.get('loss_fn', self.loss_fn).__name__
 
         self.in_codist = False
         self.in_swa = False
@@ -205,16 +226,6 @@ class Trainer():
 
         self.step = 0
         self.epoch = 0
-
-        # save hyperparameters
-        hparams_dict = {
-            'world_size': self.world_size,
-            'batch_size': self.train_loader.batch_size,
-            'epochs_sgd': epochs_sgd,
-            'epochs_codist': epochs_codist,
-            'epochs_swa': epochs_swa,
-            'optimizer': type(self.optimizer).__name__
-        }
 
         # add the rest of the hyperparams
         hparams_dict.update(self.optimizer.defaults)
@@ -273,7 +284,7 @@ class Trainer():
 
         # codistillation
         if not self.stop_early and epochs_codist > 0:
-            self._codist(epochs_codist)
+            self._codist(epochs_codist, codist_kwargs)
 
         # stochastic weight averaging
         if not self.stop_early and epochs_swa > 0:
@@ -298,9 +309,9 @@ class Trainer():
 
             # in distributed mode, check if all ranks have reached stopping acc
             if is_multiproc():
-                stop_early = all_gather(torch.asarray(True, device=self.device),
-                                        rank=self.rank,
-                                        world_size=self.world_size)
+                _, stop_early = all_gather(torch.asarray(True, device=self.device),
+                                           rank=self.rank,
+                                           world_size=self.world_size)
                 self.stop_early = parameters_to_vector(stop_early).all().cpu().item()
 
             if self.stop_early:
@@ -322,18 +333,20 @@ class Trainer():
             self._train_epoch()
 
 
-    def _codist(self, epochs):
+    def _codist(self, epochs, codist_kwargs):
         self.in_codist = True
 
         if self.prints:
             print(f'Starting codistillation phase...\n')
 
-        # switch to codistillation loss
-        self.codist_loss_fn = CodistillationLoss(self.loss_fn,
+        loss_fn = codist_kwargs.get('loss_fn', self.loss_fn)
+
+        # init codistillation loss
+        self.codist_loss_fn = CodistillationLoss(loss_fn,
                                                  self.model,
-                                                 self.device,
                                                  self.rank,
-                                                 self.world_size)
+                                                 self.world_size,
+                                                 **codist_kwargs)
 
         # epoch loop
         for _ in range(self.epoch, self.epoch + epochs):
@@ -370,17 +383,8 @@ class Trainer():
 
 
     def _train_epoch(self):
-        """
-        Trains the model for one epoch.
+        """Trains the model for one epoch.
 
-        Parameters
-        ----------
-        epoch: int
-            Epoch number
-
-        Return
-        ------
-        mean_epoch_loss: float
         """
         self.model.train()
 
@@ -388,6 +392,8 @@ class Trainer():
         self.epoch += 1
         loss = 0.
         acc = 0.
+        codist_loss = 0.
+        metrics = {}
 
         if self.ddp:
             # required so that shuffling changes across epochs when using
@@ -395,45 +401,62 @@ class Trainer():
             self.train_loader.sampler.set_epoch(self.epoch)
 
         # training loop
-        for batch_idx, (image, target) in enumerate(self.train_loader):
+        for batch_idx, (x, y) in enumerate(self.train_loader):
             step += 1
 
-            image, target = image.to(self.device), target.to(self.device)
+            x, y = x.to(self.device), y.to(self.device)
 
-            step_loss, step_acc = self._train_step(image, target)
+            # mean over the batch size
+            step_metrics = self._train_step(x, y)
 
-            loss += step_loss
-            acc += step_acc
-
-            step_train_loss = loss / (batch_idx + 1)
-            step_train_acc = acc / (batch_idx + 1)
+            for name, metric in step_metrics.items():
+                # running sum of batch mean metrics
+                metrics[name] = metrics.get(name, 0.) + metric
 
             train_end = batch_idx == self.n_batches - 1
 
+            if train_end:
+                for name, metric in step_metrics.items():
+                    # running sum over steps in epoch
+                    metrics[name] = metrics[name] / self.n_batches
+
             if self.prints and (batch_idx % self.n_print == 0 or train_end):
+
+                metrics_ = metrics if train_end else step_metrics
+                metrics_str = 'Metrics (epoch mean): ' if train_end else 'Metrics (batch mean): '
+                metrics_str = metrics_str + \
+                    f'{self.loss_fn.__name__}={metrics_["loss"]:.6f} <> '
+
+                metric_strs = []
+                for name, metric in metrics_.items():
+                    if name != 'loss':
+                        metric_strs.append(f'{name}={metric:.6f}')
+
+                metrics_str += ' <> '.join(metric_strs)
 
                 end = '\n' if train_end else ''
                 print(
-                    f'\rTrain epoch: {self.epoch} -- '
-                    f'Accuracy: {step_train_acc:.6f} -- '
-                    f'Avg. loss ({self.loss_fn.__name__}): {step_train_loss:.6f} -- '
-                    f'Batch: {batch_idx + 1}/{self.n_batches} '
-                    f'({100. * (batch_idx + 1) / self.n_batches:.0f}%) -- '
+                    f'\rTrain epoch: {self.epoch} | {metrics_str} | '
+                    f'Batch (size {x.shape[0]}): {batch_idx + 1}/{self.n_batches} '
+                    f'({100. * (batch_idx + 1) / self.n_batches:.0f}%) | '
                     f'Total steps: {step}',
                     end=end
                 )
 
-            # unless target acc is reached, validate steps
+            # TODO: replace (step_)loss and (step_)acc with metrics
+
+            # if there are any validation steps within the epoch and target acc
+            # hasn't been reached, validate steps
             if (self.val_freq and
+                not train_end and
                 not self.stop_early and
-                batch_idx < self.n_batches - 1 and
                 (batch_idx + 1) % self.val_freq == 0 and
                  self.val_freq <= self.n_batches - (batch_idx + 1)):
 
                 # save metrics, validate and log metrics every val_freq steps
                 self.step = step
-                self.step_train_loss = step_train_loss
-                self.step_train_acc = step_train_acc
+                self.step_train_loss = step_metrics['loss']
+                self.step_train_acc = step_metrics['acc']
                 self._validate(step_type='step')
 
         if self.n_plot > 0 and self.epoch % self.n_plot == 0:
@@ -443,12 +466,12 @@ class Trainer():
         # update step training metrics at end of epoch
         if not self.stop_early:
             self.step = step
-            self.step_train_loss = step_train_loss
-            self.step_train_acc = step_train_acc
+            self.step_train_loss = step_metrics['loss']
+            self.step_train_acc = step_metrics['acc']
 
         # calculate epoch training metrics
-        self.train_loss = loss / self.n_batches
-        self.train_acc = acc / self.n_batches
+        self.train_loss = metrics['loss']
+        self.train_acc = metrics['acc']
         self.train_losses.append(self.train_loss)
         self.train_accs.append(self.train_acc)
 
@@ -462,38 +485,44 @@ class Trainer():
             self.scheduler.step()
 
 
-    def _train_step(self, image, target):
+    def _train_step(self, x, y):
         """
         Trains the model for one iteration on a batch of data.
 
         Parameters
         ----------
-        image: torch.Tensor
-            A batch of input images. Shape : (batch_size, channel, height, width).
-        image: torch.Tensor
-            A batch of corresponding labels.
+        x: torch.Tensor
+            A batch of input observations.
+        y: torch.Tensor
+            A batch of corresponding outputs.
         """
         # clear gradients
         self.optimizer.zero_grad()
 
         # calculate the loss & gradients
-        output = self.model(image)
+        output = self.model(x)
 
-        loss = self.loss_fn(output, target)
-        loss_ = loss.clone().detach()
+        metrics = {
+            'loss': self.loss_fn(output, y),
+            'acc': accuracy(output, y),
+        }
 
         if self.in_codist:
-            loss += self.codist_loss_fn(image, output)
-
-        loss.backward()
+            metrics['codist_loss'] = self.codist_loss_fn(x, output)
+            codist_loss = metrics['codist_loss']
+            # codist_steps = self.codist_loss_fn.step
+            # if codist_steps < 1750:
+                # codist_loss = codist_steps * codist_loss / 1750
+            (metrics['loss'] + codist_loss).backward()
+        else:
+            metrics['loss'].backward()
 
         self.optimizer.step()
 
-        # calculate accuracy
-        acc = accuracy(output, target)
+        for name, metric in metrics.items():
+            metrics[name] = metric.item()
 
-        # TODO: inspect codist contribution to loss
-        return loss_.item(), acc.item()
+        return metrics
 
 
     def _validate(self, step_type='epoch'):
@@ -523,23 +552,30 @@ class Trainer():
 
         # validation loop
         with torch.inference_mode():
-            for batch_idx, (image, target) in enumerate(self.valid_loader):
-                image, target = image.to(self.device), target.to(self.device)
+            for batch_idx, (x, y) in enumerate(self.valid_loader):
+                x, y = x.to(self.device), y.to(self.device)
 
                 if self.in_swa:
-                    output = self.swa_model(image)
+                    output = self.swa_model(x)
                 else:
-                    output = self.model(image)
+                    output = self.model(x)
 
-                loss += self.loss_fn(output, target).item()
+                batch_loss = self.loss_fn(output, y).item()
+                loss += batch_loss
 
-                acc += accuracy(output, target).item()
-                step_valid_loss = loss / (batch_idx + 1)
-                step_valid_acc = acc / (batch_idx + 1)
+                batch_acc = accuracy(output, y).item()
+                acc += batch_acc
 
                 # final validation batch?
                 val_end = batch_idx == (n_batches - 1)
-                metrics = [('\r', step_valid_acc, step_valid_loss)]
+
+                if val_end:
+                    loss = loss / n_batches
+                    acc = acc / n_batches
+                    batch_loss = loss
+                    batch_acc = acc
+
+                metrics = [('\r', batch_acc, batch_loss)]
 
                 if self.n_print > 0 and (val_end or (batch_idx % self.n_print) == 0):
 
@@ -551,9 +587,9 @@ class Trainer():
                             print('\r', end='')
 
                         # gather all ranks' metrics at end of validation
-                        metrics = all_gather(torch.asarray(metrics[0][1:], device=self.device),
-                                             rank=self.rank,
-                                             world_size=self.world_size)
+                        _, metrics = all_gather(torch.asarray(metrics[0][1:], device=self.device),
+                                                rank=self.rank,
+                                                world_size=self.world_size)
 
                         for i, arr in enumerate(metrics):
                             arr.cpu()
@@ -563,42 +599,41 @@ class Trainer():
 
                     if prints:
                         # only print on rank 0
-                        for (begin, step_acc, step_loss) in metrics:
-                            print(
-                                f'{begin}Validation accuracy: {step_acc:.6f} | '
-                                f'Avg. loss ({self.loss_fn.__name__}): {step_loss:.6f} | '
-                                f'Batch: {batch_idx + 1}/{n_batches} '
-                                f'({100.*(batch_idx + 1) / n_batches:.0f}%)',
-                                end=end
-                            )
+                        for (begin, batch_acc, batch_loss) in metrics:
+                            print(f'{begin}Validation | '
+                                  f'{self.loss_fn.__name__}={batch_loss:.6f} <> '
+                                  f'accuracy={batch_acc:.6f} | '
+                                  f'Batch: {batch_idx + 1}/{n_batches} '
+                                  f'({100.*(batch_idx + 1) / n_batches:.0f}%)',
+                                  end=end)
 
         if prints:
             print()
 
         if epoch_val:
             # save epoch loss and acc
-            self.valid_loss = step_valid_loss
-            self.valid_acc = step_valid_acc
+            self.valid_loss = loss
+            self.valid_acc = acc
 
             # add to epoch history
-            self.valid_losses.append(step_valid_loss)
-            self.valid_accs.append(step_valid_acc)
+            self.valid_losses.append(loss)
+            self.valid_accs.append(acc)
 
             # log training and validation metrics for epoch
             self._log_together(step_type='epoch')
             self._log_separate(step_type='epoch')
 
-        # save step loss (including for epoch val) if target acc has not been reached
         if not self.stop_early:
-            self.step_valid_loss = step_valid_loss
-            self.step_valid_acc = step_valid_acc
+            # save step loss (including for epoch val) if target acc has not been reached
+            self.step_valid_loss = loss
+            self.step_valid_acc = acc
 
             # log training and validation metrics for step
             self._log_together(step_type='step')
             self._log_separate(step_type='step')
 
-        # check if we should stop early
-        self._check_for_early_stop(step_valid_acc)
+            # check if we should stop early
+            self._check_for_early_stop(acc)
 
         # plot or log feature maps and filters
         if epoch_val and self.n_plot > 0 and step % self.n_plot == 0:
