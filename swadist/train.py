@@ -13,7 +13,6 @@ import numpy as np
 
 from torch.nn.utils import parameters_to_vector
 from torchvision.utils import make_grid
-from torch.optim.swa_utils import AveragedModel, update_bn, SWALR
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from torch.utils.tensorboard import SummaryWriter
 
@@ -120,6 +119,7 @@ class Trainer():
 
         # set during training
         self.hparams_dict = None
+        self.swadist = None
         self.in_codist = None
         self.in_swa = None
         self.val_freq = None
@@ -168,7 +168,7 @@ class Trainer():
         epochs_swa: int, optional
             Number of epochs using stochastic weight averaging.
         swadist: bool, optional
-            If True, use codistillation during the SWA phase. (NOT IMPLEMENTED)
+            If True, use codistillation during the SWA phase.
         codist_kwargs: dict, optional
             Additional keyword arguments to pass to `CodistillationLoss` initializer.
         validate_per_epoch: int, optional
@@ -182,6 +182,8 @@ class Trainer():
             Directory to use for saving the model.
 
         """
+        self.swadist = swadist
+
         # save hyperparameters
         hparams_dict = {
             'world_size': self.world_size,
@@ -189,11 +191,12 @@ class Trainer():
             'epochs_sgd': epochs_sgd,
             'epochs_codist': epochs_codist,
             'epochs_swa': epochs_swa,
+            'swadist': self.swadist,
             'optimizer': type(self.optimizer).__name__,
             'loss_fn': self.loss_fn.__name__,
         }
 
-        if epochs_codist > 0:
+        if self.swadist or epochs_codist > 0:
             assert not self.ddp, \
                 'Codistillation is incompatible with DistributedDataParallel models.'
             assert is_multiproc(), \
@@ -246,7 +249,7 @@ class Trainer():
 
             else:
                 hparams_dict['swa_scheduler'] = type(self.swa_scheduler).__name__
-                if isinstance(self.swa_scheduler, SWALR):
+                if isinstance(self.swa_scheduler, torch.optim.swa_utils.SWALR):
                     hparams_dict['swa_scheduler_swa_lr'] = self.swa_scheduler.optimizer.param_groups[0]['swa_lr']
                     hparams_dict['swa_scheduler_anneal_epochs'] = self.swa_scheduler.anneal_epochs
                     hparams_dict['swa_scheduler_anneal_strategy'] = self.swa_scheduler.anneal_func.__name__
@@ -288,7 +291,7 @@ class Trainer():
 
         # stochastic weight averaging
         if not self.stop_early and epochs_swa > 0:
-            self._swa(epochs_swa)
+            self._swa(epochs_swa, codist_kwargs)
 
         if not self.stop_early:
             # cache the trained network
@@ -336,7 +339,7 @@ class Trainer():
     def _codist(self, epochs, codist_kwargs):
         self.in_codist = True
 
-        if self.prints:
+        if epochs > 0 and self.prints:
             print(f'Starting codistillation phase...\n')
 
         loss_fn = codist_kwargs.get('loss_fn', self.loss_fn)
@@ -356,22 +359,33 @@ class Trainer():
 
             self._train_epoch()
 
+        # if this is swadist, keep using CodistillationLoss
+        self.in_codist = self.swadist
 
-    def _swa(self, epochs):
+
+    def _swa(self, epochs, codist_kwargs):
         self.in_swa = True
 
         if self.prints:
-            print(f'Starting SWA phase...\n')
+            if self.in_codist:
+                print(f'Starting SWADist phase...\n')
+            else:
+                print(f'Starting SWA phase...\n')
 
         # create the model for SWA
-        # TODO: may want to store other model on cpu when not in use
-        self.swa_model = AveragedModel(self.model)
+        # TODO: may want to store AveragedModel on cpu when not in use
+        self.swa_model = torch.optim.swa_utils.AveragedModel(self.model)
+
+        if self.swadist and self.codist_loss_fn is None:
+
+            # initialize self.codist_loss_fn
+            self._codist(epochs=0, codist_kwargs=codist_kwargs)
+
+            # synchronize AveragedModel replicas
+            self.codist_loss_fn.update_swa_replicas(self.swa_model)
 
         if isinstance(self.swa_scheduler, dict):
-            self.swa_scheduler = SWALR(self.optimizer, **self.swa_scheduler)
-
-        # if self.swalr_kwargs is not None:
-        #     self.swa_scheduler = SWALR(self.optimizer, **self.swalr_kwargs)
+            self.swa_scheduler = torch.optim.swa_utils.SWALR(self.optimizer, **self.swa_scheduler)
 
         # epoch loop
         for _ in range(self.epoch, self.epoch + epochs):
@@ -392,7 +406,6 @@ class Trainer():
         self.epoch += 1
         loss = 0.
         acc = 0.
-        codist_loss = 0.
         metrics = {}
 
         if self.ddp:
@@ -442,8 +455,6 @@ class Trainer():
                     f'Total steps: {step}',
                     end=end
                 )
-
-            # TODO: replace (step_)loss and (step_)acc with metrics
 
             # if there are any validation steps within the epoch and target acc
             # hasn't been reached, validate steps
@@ -508,6 +519,7 @@ class Trainer():
         }
 
         if self.in_codist:
+
             metrics['codist_loss'] = self.codist_loss_fn(x, output)
             codist_loss = metrics['codist_loss']
             # codist_steps = self.codist_loss_fn.step
@@ -543,10 +555,16 @@ class Trainer():
         prints = epoch_val and self.prints
         n_batches = len(self.valid_loader)
 
-        if self.in_swa:
+        # TODO: how often AveragedModel is updated should be up to user
+        if self.in_swa and epoch_val:
             # update the AveragedModel and batchnorm stats before every eval
             self.swa_model.update_parameters(self.model)
-            update_bn(self.train_loader, self.swa_model, self.device)
+
+            if self.swadist:
+                # update AveragedModel replicas synchronously
+                self.codist_loss_fn.update_swa_replicas(self.swa_model)
+
+            torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
 
         self.model.eval()
 

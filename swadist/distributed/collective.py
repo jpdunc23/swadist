@@ -30,8 +30,12 @@ class Handler(object):
 
 
     def wait(self):
+        """Blocks until self.handle is complete.
+
+        """
         if self.handle is not None:
-            self.handle.wait()
+            while not self.is_completed():
+                self.handle.wait()
 
 
 def all_gather(*send: torch.Tensor,
