@@ -23,6 +23,7 @@ def spawn_fn(rank: int,
              scheduler_kwargs: dict=None,
              swa_scheduler_kwargs: dict=None,
              seed: int=None,
+             ddp: bool=True,
              addr: str='127.0.0.1',
              port: str='6016',
              backend: str=None):
@@ -32,7 +33,7 @@ def spawn_fn(rank: int,
     Parameters
     ----------
     rank: int
-        Automatically passed to this function by `mp.spawn`
+        Automatically passed to this function by `torch.multiprocessing.spawn`
     world_size: int
         Number of distributed workers.
     dataloader_kwargs: dict
@@ -51,6 +52,8 @@ def spawn_fn(rank: int,
         Keyword arguments to pass to `torch.optim.swa_utils.SWALR`.
     seed: int, optional
         Added to `rank` and passed to `torch.manual_seed`.
+    ddp: bool, optional
+        If True, use `torch.distributed.DistributedDataParallel` when possible.
     addr, port, backend: str, optional
         Used to setup the process group.
 
@@ -91,7 +94,7 @@ def spawn_fn(rank: int,
 
     train_loader, valid_loader = get_dataloaders(**dataloader_kwargs)
 
-    data_parallel = dataloader_kwargs.get('data_parallel', False)
+    data_parallel = dataloader_kwargs.get('data_parallel', False) and ddp
 
     if seed is not None and cuda:
         torch.cuda.manual_seed(seed + rank + 1)

@@ -34,8 +34,8 @@ class Handler(object):
 
         """
         if self.handle is not None:
-            while not self.is_completed():
-                self.handle.wait()
+            rank = dist.get_rank()
+            self.handle.wait()
 
 
 def all_gather(*send: torch.Tensor,

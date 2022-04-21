@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .viz import show_imgs
 from .optim import LinearPolyLR
-from .metrics import accuracy, CodistillationLoss
+from .metrics import accuracy, CodistillationLoss, SWADistLoss
 from .distributed import all_gather, is_multiproc
 
 
@@ -99,6 +99,7 @@ class Trainer():
 
         self.loss_fn = loss_fn
         self.codist_loss_fn = None
+        self.swadist_loss_fn = None
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.swa_scheduler = swa_scheduler
@@ -262,7 +263,7 @@ class Trainer():
         # setup logging
         if self.logs:
             # create the writer
-            self.writer = SummaryWriter(f'{self.log_dir}/{train_id}')
+            self.writer = SummaryWriter(f'{self.log_dir}/{self.train_id}')
 
         total_epochs = epochs_sgd + epochs_codist + epochs_swa
         if not is_multiproc():
@@ -273,9 +274,10 @@ class Trainer():
                   f'{total_epochs}-epoch training loop...')
 
         if self.prints:
+            swa_str = 'SWADist' if self.swadist else 'SWA'
             print(f'SGD epochs: {epochs_sgd} | '
                   f'Codistillation epochs: {epochs_codist} | '
-                  f'SWA epochs: {epochs_swa}')
+                  f'{swa_str} epochs: {epochs_swa}')
             print(f'DistributedDataParallel: {self.ddp}')
             print(f'Stopping accuracy: {self.stopping_acc}\n')
             # print('Param preview:')
@@ -283,14 +285,17 @@ class Trainer():
 
         # vanilla SGD / burn-in
         if epochs_sgd > 0:
+
             self._sgd(epochs_sgd)
 
         # codistillation
         if not self.stop_early and epochs_codist > 0:
+
             self._codist(epochs_codist, codist_kwargs)
 
         # stochastic weight averaging
         if not self.stop_early and epochs_swa > 0:
+
             self._swa(epochs_swa, codist_kwargs)
 
         if not self.stop_early:
@@ -363,11 +368,11 @@ class Trainer():
         self.in_codist = self.swadist
 
 
-    def _swa(self, epochs, codist_kwargs):
+    def _swa(self, epochs, swadist_kwargs):
         self.in_swa = True
 
         if self.prints:
-            if self.in_codist:
+            if self.swadist:
                 print(f'Starting SWADist phase...\n')
             else:
                 print(f'Starting SWA phase...\n')
@@ -376,13 +381,19 @@ class Trainer():
         # TODO: may want to store AveragedModel on cpu when not in use
         self.swa_model = torch.optim.swa_utils.AveragedModel(self.model)
 
-        if self.swadist and self.codist_loss_fn is None:
+        if self.swadist:
+
+            self.codist_loss_fn = None
+
+            loss_fn = swadist_kwargs.get('loss_fn', self.loss_fn)
 
             # initialize self.codist_loss_fn
-            self._codist(epochs=0, codist_kwargs=codist_kwargs)
-
-            # synchronize AveragedModel replicas
-            self.codist_loss_fn.update_swa_replicas(self.swa_model)
+            self.swadist_loss_fn = SWADistLoss(loss_fn,
+                                               self.model,
+                                               self.swa_model,
+                                               self.rank,
+                                               self.world_size,
+                                               **swadist_kwargs)
 
         if isinstance(self.swa_scheduler, dict):
             self.swa_scheduler = torch.optim.swa_utils.SWALR(self.optimizer, **self.swa_scheduler)
@@ -466,6 +477,7 @@ class Trainer():
 
                 # save metrics, validate and log metrics every val_freq steps
                 self.step = step
+                self.step_train_metrics = step_metrics
                 self.step_train_loss = step_metrics['loss']
                 self.step_train_acc = step_metrics['acc']
                 self._validate(step_type='step')
@@ -477,6 +489,7 @@ class Trainer():
         # update step training metrics at end of epoch
         if not self.stop_early:
             self.step = step
+            self.step_train_metrics = step_metrics
             self.step_train_loss = step_metrics['loss']
             self.step_train_acc = step_metrics['acc']
 
@@ -520,12 +533,17 @@ class Trainer():
 
         if self.in_codist:
 
-            metrics['codist_loss'] = self.codist_loss_fn(x, output)
-            codist_loss = metrics['codist_loss']
-            # codist_steps = self.codist_loss_fn.step
-            # if codist_steps < 1750:
-                # codist_loss = codist_steps * codist_loss / 1750
-            (metrics['loss'] + codist_loss).backward()
+            if self.in_swa:
+                metric_name = 'swadist_loss'
+            else:
+                metric_name = 'codist_loss'
+
+            _loss_fn = getattr(self, metric_name + '_fn')
+            metrics[metric_name] = _loss_fn(x, output)
+
+            # backprop on mean of losses
+            (metrics['loss'] + metrics[metric_name]).backward()
+
         else:
             metrics['loss'].backward()
 
@@ -562,11 +580,14 @@ class Trainer():
 
             if self.swadist:
                 # update AveragedModel replicas synchronously
-                self.codist_loss_fn.update_swa_replicas(self.swa_model)
+                self.swadist_loss_fn.update_replicas()
 
             torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
 
-        self.model.eval()
+        if self.in_swa:
+            self.swa_model.eval()
+        else:
+            self.model.eval()
 
         # validation loop
         with torch.inference_mode():
@@ -676,7 +697,14 @@ class Trainer():
                 valid_acc = self.step_valid_acc
                 valid_loss = self.step_valid_loss
                 step = self.step
-            if not self.stop_early:
+
+            # TODO: clean up
+            if step_type == 'step' and not self.stop_early:
+                for name, metric in self.step_train_metrics.items():
+                    if name not in ['acc', 'loss'] and not self.stop_early:
+                        self.writer.add_scalar(f'{step_type} loss/{name}/train', metric, step)
+
+            if step_type == 'epoch' or not self.stop_early:
                 self.writer.add_scalar(f'{step_type} acc/valid', valid_acc, step)
                 self.writer.add_scalar(f'{step_type} acc/train', train_acc, step)
                 self.writer.add_scalar(f'{step_type} loss/valid', valid_loss, step)
@@ -704,6 +732,7 @@ class Trainer():
                                         {'valid': valid_acc, 'train': train_acc}, step)
                 self.writer.add_scalars(f'{step_type} loss',
                                         {'valid': valid_loss, 'train': train_loss}, step)
+
 
 
     def _log_hparam_metrics(self):
@@ -828,7 +857,7 @@ class Trainer():
                 save_dir = self.save_dir
 
             if is_multiproc():
-                train_id = self.train_id + f'rank{self.rank}'
+                train_id = self.train_id + f'_rank{self.rank}'
 
             save_path = os.path.join(save_dir, f'{train_id}.pt')
 
@@ -852,7 +881,7 @@ class Trainer():
         if self.scheduler is not None:
             save_dict['scheduler_state_dict'] = self.scheduler.state_dict()
 
-        if self.swa_scheduler is not None:
+        if self.swa_scheduler is not None and not isinstance(self.swa_scheduler, dict):
             save_dict['swa_scheduler_state_dict'] = self.swa_scheduler.state_dict()
 
         torch.save(save_dict, save_path, **kwargs)
