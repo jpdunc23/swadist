@@ -1,134 +1,157 @@
 """Run experiments for CIFAR-10.
 
-WARNING: out of date
-TODO: replace main() with spawn_fn
-
 """
 
 import os
+import time
 import argparse
-from datetime import datetime
+import datetime
 
-import matplotlib.pyplot as plt
+from copy import deepcopy
+
 import numpy as np
-import pandas as pd
 
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn import functional as F
-from torch.utils.tensorboard import SummaryWriter
 
-from swadist.data.loader import get_dataloaders
-from swadist.utils import Trainer, show_imgs
-from swadist.models.resnet import ResNet
-
-def main(rank, world_size, batch_size, lr0, momentum, exper, datadir, rundir, stopping_acc=0.9):
-    if rank == 0:
-        print(f'{exper} experiment: batch_size={batch_size}, lr0={lr0:.6f}, momentum={momentum:.6f} ')
-
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '6006'
-
-    # initialize the process group
-    dist.init_process_group('nccl', rank=rank, world_size=world_size)
-
-    # pin process to a single device
-    torch.cuda.set_device(rank)
-    model = ResNet(in_kernel_size=3, stack_sizes=[1, 1, 1], n_classes=10,
-                   batch_norm=False).to(rank)
-
-    # epochs, scaling epochs, decay factor
-    epochs, T, alpha = 25, 20, 0.25
-    lr_lambda = lambda epoch: 1 - (1 - alpha)*epoch/T if epoch < T else alpha
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr0, momentum=momentum, nesterov=True)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # load training and validation data
-    train_loader, valid_loader = get_dataloaders('cifar10', root_dir=datadir,
-                                                 test=False, batch_size=batch_size)
-
-    # setup optimizer / lr sched
-    lr_lambda = lambda epoch: 1 - (1 - alpha)*epoch/T if epoch < T else (alpha if epoch < epochs else lr0)
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr0,
-                                momentum=momentum, nesterov=True)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    trainer = Trainer(model, F.cross_entropy, optimizer, scheduler,
-                      log=True, log_dir=rundir, name=exper,
-                      device=rank, rank=rank, world_size=world_size,
-                      data_parallel=True)
-
-    # train
-    if exper == 'sgd':
-        trainer.train(train_loader, valid_loader, epochs=epochs,
-                      stopping_acc=stopping_acc,
-                      validations_per_epoch=4)
-        n_epochs = trainer.total_train_epochs
-
-
-    if exper == 'swa':
-        trainer.train(train_loader, valid_loader, epochs=epochs-5,
-                      swa_epochs=5, stopping_acc=stopping_acc,
-                      validations_per_epoch=4)
-        n_epochs = trainer.total_train_epochs
-
-
-    if exper == 'codist':
-        trainer.train(train_loader, valid_loader, epochs=2,
-                      codist_epochs=epochs-5, stopping_acc=stopping_acc,
-                      validations_per_epoch=4)
-        n_epochs = trainer.total_train_epochs
-
-
-    elif exper == 'swadist':
-        trainer.train(train_loader, valid_loader, epochs=5,
-                      codist_epochs=epochs-10, swa_epochs=5,
-                      stopping_acc=stopping_acc, validations_per_epoch=4)
-
-    # record metrics
-    train_loss = trainer.train_losses[n_epochs]
-    valid_loss = trainer.valid_losses[n_epochs]
-    train_acc = trainer.train_accs[n_epochs]
-    valid_acc = trainer.valid_accs[n_epochs]
-    trainer.writer.add_hparams(
-        { 'lr': lr0, 'batch_size': batch_size, 'momentum': momentum,
-          'stopping_acc': stopping_acc, 'T': T, 'alpha': alpha },
-        {'hparam/train accuracy': train_acc , 'hparam/train loss': train_loss,
-         'hparam/valid accuracy': valid_acc, 'hparam/valid accuracy': valid_acc}
-    )
-    trainer.writer.close()
+from swadist.utils import spawn_fn
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--exper', help='Which experiment to run.')
     parser.add_argument('--datadir', help='Path to data directory.')
-    parser.add_argument('--rundir', help='Path to directory where the Tensorboard log is saved')
+    parser.add_argument('--logdir', help='Path to directory where the Tensorboard logs are saved.')
+    parser.add_argument('--savedir', help='Path to directory where state_dicts are saved.')
     args = parser.parse_args()
-    exper = args.exper
     datadir = args.datadir
-    rundir = args.rundir
+    logdir = args.logdir
+    savedir = args.savedir
 
-    world_size = torch.cuda.device_count()
-    print(f'n GPUs: {world_size}')
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print('Using cuda')
+    else:
+        print('Using cpu')
+
+    # mp.spawn may throw an error without this
+    os.environ['MKL_THREADING_LAYER'] = 'GNU'
+
+    # number of model replicas
+    world_size = 2
+
+    common_kwargs = {
+        'dataloader_kwargs': {
+            'dataset': 'cifar10',
+            'root_dir': datadir,
+            'num_workers': 2,
+        },
+        'model_kwargs': {
+            'n_classes': 10,
+            'in_kernel_size': 3,
+            'stack_sizes': [1, 1, 1],
+            'batch_norm': False,
+        },
+        'optimizer_kwargs': {
+            'nesterov': True,
+        },
+        'trainer_kwargs': {
+            'log': True,
+            'log_dir': logdir,
+            'save_dir': savedir,
+            'n_print': 10,
+        },
+        'train_kwargs': {
+            'codist_kwargs': {
+                'sync_freq': 50,
+                'transform': 'softmax',
+            },
+            'validate_per_epoch': 4,
+            'save': True,
+        },
+        'scheduler_kwargs': {
+            'alpha': 0.25,
+            'decay_epochs': 15,
+        },
+        'swa_scheduler_kwargs': {
+            'anneal_strategy': 'cos',
+            'anneal_epochs': 3,
+        },
+    }
 
     # batch_size
     # batch_size = [2**i for i in range(1, 14)]
     batch_size = [2**i for i in range(6, 14)]
 
-    # initial lr, scaling factor, momentum
+    # initial lr and momentum
     # lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
     lr0 = 2**np.array([-5., -5., -5., -6., -5., -7., -4., -6.])
+
     # momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
     momentum = [.95, .97, .975, .98, .975, .98, .97, .975]
 
     assert len(lr0) == len(batch_size), 'lr0 has the wrong size'
-    assert len(momentum) == len(momentum), 'momentum has the wrong size'
+    assert len(momentum) == len(batch_size), 'momentum has the wrong size'
 
-    if world_size > 1:
+    seed = int((datetime.date.today() - datetime.date(2022, 4, 11)).total_seconds())
+    print(f'seed: {seed}')
 
-        for b, l, m in zip(batch_size, lr0, momentum):
-            args = (world_size, b, l, m, exper, datadir, rundir)
-            mp.spawn(main, args=args, nprocs=world_size, join=True)
+    methods = ['sgd', 'swa', 'codist', 'codist-swa', 'swadist']
+    method_kwargs = { method: deepcopy(common_kwargs) for method in methods }
+
+    method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
+    method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
+    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 15, 'codist_kwargs': None })
+
+    method_kwargs['swa']['dataloader_kwargs'].update({ 'data_parallel': True })
+    method_kwargs['swa']['trainer_kwargs'].update({ 'name': 'swa' })
+    method_kwargs['swa']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_swa': 5, 'codist_kwargs': None })
+
+    method_kwargs['codist']['dataloader_kwargs'].update({ 'split_training': True })
+    method_kwargs['codist']['trainer_kwargs'].update({ 'name': 'codist' })
+    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 5, 'epochs_codist': 10 })
+
+    method_kwargs['codist-swa']['dataloader_kwargs'].update({ 'split_training': True })
+    method_kwargs['codist-swa']['trainer_kwargs'].update({ 'name': 'codist-swa' })
+    method_kwargs['codist-swa']['train_kwargs'].update({ 'epochs_sgd': 5, 'epochs_codist': 5, 'epochs_swa': 5 })
+
+    method_kwargs['swadist']['dataloader_kwargs'].update({ 'split_training': True })
+    method_kwargs['swadist']['trainer_kwargs'].update({ 'name': 'swadist' })
+    method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 5,
+                                                      'epochs_codist': 5,
+                                                      'epochs_swa': 5,
+                                                      'swadist': True })
+
+    for bs, lr, mo in zip(batch_size, lr0, momentum):
+
+        for method, kwargs in method_kwargs.items():
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            kwargs['dataloader_kwargs']['batch_size'] = bs // world_size
+            kwargs['optimizer_kwargs'].update({ 'lr': lr, 'momentum': mo })
+            kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
+
+            if method in ['sgd', 'codist']:
+                swa_scheduler_kwargs = None
+            else:
+                swa_scheduler_kwargs = kwargs['swa_scheduler_kwargs']
+
+            args = (world_size,
+                    kwargs['dataloader_kwargs'],
+                    kwargs['model_kwargs'],
+                    kwargs['optimizer_kwargs'],
+                    kwargs['trainer_kwargs'],
+                    kwargs['train_kwargs'],
+                    kwargs['scheduler_kwargs'],
+                    swa_scheduler_kwargs,
+                    seed)
+
+            tic = time.perf_counter()
+
+            mp.spawn(spawn_fn, args=args, nprocs=world_size, join=True)
+
+            print(f'time elapsed: {(time.perf_counter() - tic) / 60:.2f}m')
+
+            seed += 1

@@ -81,7 +81,7 @@ def spawn_fn(rank: int,
     else:
         device = 'cpu'
 
-    print(f'Rank {rank}: joined process group on device {device}')
+    print(f'Rank {rank}: joined process group on device {device} with backend {backend}')
 
     if seed is not None:
         torch.manual_seed(seed + rank)
@@ -102,7 +102,8 @@ def spawn_fn(rank: int,
 
     # model
     model = ResNet(**model_kwargs, device=device)
-    if cuda and data_parallel and not train_kwargs.get('epochs_codist', 0) > 0:
+    codist = train_kwargs.get('epochs_codist', 0) > 0 or train_kwargs.get('swadist', False)
+    if cuda and data_parallel and not codist:
         # codistillation is incompatible with DDP
         print(f'Rank {rank}: using DistributedDataParallel')
         model = DistributedDataParallel(model)
@@ -132,6 +133,12 @@ def spawn_fn(rank: int,
 
     trainer = Trainer(**trainer_kwargs)
 
+    # we'll save after adding the seed
+    save = train_kwargs.get('save', False)
+    train_kwargs['save'] = False
+
     # start training
-    train_kwargs.setdefault('save', False)
     trainer.train(**train_kwargs)
+
+    trainer.hparams_dict['spawn_fn_seed'] = seed if seed is None else seed + rank
+    trainer.save()
