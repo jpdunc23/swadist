@@ -12,7 +12,6 @@ from copy import deepcopy
 import numpy as np
 
 import torch
-import torch.multiprocessing as mp
 
 from swadist.utils import spawn_fn
 
@@ -66,7 +65,7 @@ if __name__ == "__main__":
                 'sync_freq': 50,
                 'transform': 'softmax',
             },
-            'validate_per_epoch': 4,
+            'validations_per_epoch': 4,
             'save': True,
         },
         'scheduler_kwargs': {
@@ -96,7 +95,7 @@ if __name__ == "__main__":
     seed = int((datetime.date.today() - datetime.date(2022, 4, 11)).total_seconds())
     print(f'seed: {seed}')
 
-    methods = ['sgd', 'swa', 'codist', 'codist-swa', 'swadist']
+    methods = ['sgd', 'swa', 'codist', 'codistswa', 'swadist']
     method_kwargs = { method: deepcopy(common_kwargs) for method in methods }
 
     method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
@@ -111,9 +110,9 @@ if __name__ == "__main__":
     method_kwargs['codist']['trainer_kwargs'].update({ 'name': 'codist' })
     method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 5, 'epochs_codist': 10 })
 
-    method_kwargs['codist-swa']['dataloader_kwargs'].update({ 'split_training': True })
-    method_kwargs['codist-swa']['trainer_kwargs'].update({ 'name': 'codist-swa' })
-    method_kwargs['codist-swa']['train_kwargs'].update({ 'epochs_sgd': 5, 'epochs_codist': 5, 'epochs_swa': 5 })
+    method_kwargs['codistswa']['dataloader_kwargs'].update({ 'split_training': True })
+    method_kwargs['codistswa']['trainer_kwargs'].update({ 'name': 'codistswa' })
+    method_kwargs['codistswa']['train_kwargs'].update({ 'epochs_sgd': 5, 'epochs_codist': 5, 'epochs_swa': 5 })
 
     method_kwargs['swadist']['dataloader_kwargs'].update({ 'split_training': True })
     method_kwargs['swadist']['trainer_kwargs'].update({ 'name': 'swadist' })
@@ -129,6 +128,9 @@ if __name__ == "__main__":
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            trainer_kwargs = deepcopy(kwargs['trainer_kwargs'])
+            trainer_kwargs['name'] = f'bs{bs}-' + trainer_kwargs['name']
+
             kwargs['dataloader_kwargs']['batch_size'] = bs // world_size
             kwargs['optimizer_kwargs'].update({ 'lr': lr, 'momentum': mo })
             kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
@@ -142,7 +144,7 @@ if __name__ == "__main__":
                     kwargs['dataloader_kwargs'],
                     kwargs['model_kwargs'],
                     kwargs['optimizer_kwargs'],
-                    kwargs['trainer_kwargs'],
+                    trainer_kwargs,
                     kwargs['train_kwargs'],
                     kwargs['scheduler_kwargs'],
                     swa_scheduler_kwargs,
@@ -150,8 +152,6 @@ if __name__ == "__main__":
 
             tic = time.perf_counter()
 
-            mp.spawn(spawn_fn, args=args, nprocs=world_size, join=True)
+            torch.multiprocessing.spawn(spawn_fn, args=args, nprocs=world_size, join=True)
 
             print(f'time elapsed: {(time.perf_counter() - tic) / 60:.2f}m')
-
-            seed += 1

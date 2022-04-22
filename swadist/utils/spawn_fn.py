@@ -69,6 +69,7 @@ def spawn_fn(rank: int,
     # initialize the process group
     os.environ['MASTER_ADDR'] = addr
     os.environ['MASTER_PORT'] = port
+
     if backend is None:
         backend = 'nccl' if cuda else 'gloo'
 
@@ -84,8 +85,8 @@ def spawn_fn(rank: int,
     print(f'Rank {rank}: joined process group on device {device} with backend {backend}')
 
     if seed is not None:
-        torch.manual_seed(seed + rank)
-        print(f'Rank {rank}: torch.manual_seed({seed + rank})')
+        torch.manual_seed(seed)
+        print(f'Rank {rank}: torch.manual_seed({seed})')
 
     # get_dataloaders
     dataloader_kwargs.setdefault('world_size', world_size)
@@ -96,10 +97,6 @@ def spawn_fn(rank: int,
 
     data_parallel = dataloader_kwargs.get('data_parallel', False) and ddp
 
-    if seed is not None and cuda:
-        torch.cuda.manual_seed(seed + rank + 1)
-        print(f'Rank {rank}: torch.cuda.manual_seed({seed + world_size + rank})')
-
     # model
     model = ResNet(**model_kwargs, device=device)
     codist = train_kwargs.get('epochs_codist', 0) > 0 or train_kwargs.get('swadist', False)
@@ -107,6 +104,8 @@ def spawn_fn(rank: int,
         # codistillation is incompatible with DDP
         print(f'Rank {rank}: using DistributedDataParallel')
         model = DistributedDataParallel(model)
+
+    print()
 
     # optimizer
     optimizer_kwargs['params'] = model.parameters()
@@ -140,5 +139,5 @@ def spawn_fn(rank: int,
     # start training
     trainer.train(**train_kwargs)
 
-    trainer.hparams_dict['spawn_fn_seed'] = seed if seed is None else seed + rank
-    trainer.save()
+    trainer.hparams['spawn_fn_seed'] = seed if seed is None else seed + rank
+    trainer.save(save_dir=train_kwargs.get('save_dir', None))

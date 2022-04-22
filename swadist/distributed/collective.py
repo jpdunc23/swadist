@@ -9,6 +9,7 @@ import torch.distributed as dist
 from torch.nn.utils import parameters_to_vector
 
 __all__ = ['all_gather',
+           'all_reduce',
            'is_multiproc']
 
 
@@ -39,12 +40,11 @@ class Handler(object):
 
 
 def all_gather(*send: torch.Tensor,
-               rank: int,
                world_size: int,
                async_op=False) -> List[torch.Tensor]:
-    """Sends input tensors from this rank to all other ranks and returns the
-    gathered list of all ranks' tensors if aync_op is False or the tensor list
-    and a async work handle otherwise.
+    """Sends input tensors from this rank to all other ranks and returns an async
+    work handle (or None if async_op=False) and the gathered list of all ranks'
+    tensors.
 
     """
     send = parameters_to_vector(send)
@@ -52,3 +52,17 @@ def all_gather(*send: torch.Tensor,
     handle = dist.all_gather(recv, send, async_op=async_op)
 
     return Handler(handle), recv
+
+
+def all_reduce(*send: torch.Tensor,
+               op=dist.ReduceOp.SUM,
+               async_op=False) -> List[torch.Tensor]:
+    """Sends input tensors from this rank to all other ranks and returns an async
+    work handle (or None if async_op=False) and a single tensor from the reduction
+    of all ranks' tensors.
+
+    """
+    tensor = parameters_to_vector(send)
+    handle = dist.all_reduce(tensor, op=op, async_op=async_op)
+
+    return Handler(handle), tensor

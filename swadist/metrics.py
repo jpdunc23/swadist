@@ -39,7 +39,7 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k / batch_size)
         if len(res) == 1:
             return res[0]
-        return res
+    return res
 
 
 _transform_fns = {
@@ -185,7 +185,6 @@ class CodistillationLoss(object):
 
         # flat_params[i] is a single Tensor with all params from rank i
         self._handle, self._flat_params_list = all_gather(*params,
-                                                          rank=self.rank,
                                                           world_size=self.world_size,
                                                           async_op=force)
 
