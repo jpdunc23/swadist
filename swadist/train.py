@@ -568,7 +568,7 @@ class Trainer():
             metrics[metric_name] = _loss_fn(x, output)
 
             # backprop on mean of losses
-            (metrics[self.loss_fn.__name__] + metrics[metric_name]).backward()
+            (0.5*(metrics[self.loss_fn.__name__] + metrics[metric_name])).backward()
 
         else:
             metrics[self.loss_fn.__name__].backward()

@@ -74,6 +74,8 @@ class ResNet(nn.Module):
     """
     Parameters
     ----------
+    n_classes: int
+        The number of output classes.
     in_channels: int, optional
         Number of input channels.
     in_kernel_size: int, optional
@@ -81,13 +83,11 @@ class ResNet(nn.Module):
     stack_sizes: List[int], optional
         The number of residual blocks in each group of layers where feature map sizes stay constant.
         The default gives ResNet-18 (or ResNet-14 when `in_kernel_size` is 3).
-    n_classes: int, optional
-        The number of output classes.
     batch_norm: bool, optional
         If True, uses batch normalization at the end of each convolutional layer.
     """
-    def __init__(self, in_channels=3, in_kernel_size=7, stack_sizes=None,
-                 n_classes=1000, batch_norm=True):
+    def __init__(self, n_classes, in_channels=3, in_kernel_size=7, stack_sizes=None,
+                 batch_norm=True, device=None):
         super().__init__()
 
         if stack_sizes is None:
@@ -121,17 +121,19 @@ class ResNet(nn.Module):
             nn.Linear(out_channels, n_classes)
         )
 
-        self.reinitialize_parameters()
+        self.reinitialize_parameters(device=device)
 
 
-    def reinitialize_parameters(self):
+    def reinitialize_parameters(self, device=None):
+        if device is not None:
+            self.to(device)
+
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-
 
 
     def _resnet_first_layer(self, in_channels, out_channels, kernel_size=7, batch_norm=True):
