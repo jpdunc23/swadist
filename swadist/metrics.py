@@ -304,7 +304,7 @@ class SWADistLoss(ReplicaLoss):
         self.update_swa_parameters()
 
 
-    def __call__(self, x):
+    def __call__(self, x, output=None):
         """Calculate SWADist component of loss, i.e. `loss_fn` applied to the output
         from `swa_model` updated with the current state of `model` and the mean
         of the `model` outputs from the other ranks in the collective.
@@ -314,13 +314,17 @@ class SWADistLoss(ReplicaLoss):
         x: torch.Tensor
             A batch of input observations.
         output: torch.Tensor
-            A batch of model outputs from this rank's model.
+            A batch of model outputs from this rank's model. If None, we create
+            the output from the swa_model instead.
 
         """
 
-        # copy swa_model
-        # TODO: keep swa model on the gpu?
-        with torch.no_grad():
+        if output is None:
+            # output comes from swa_model
+
+            # with torch.no_grad():
+            # copy swa_model
+            # TODO: keep swa model on the gpu?
             swa_model = deepcopy(self.swa_model).to(self.rank)
 
             for p_swa, p_model, p_old in self._zip_params(swa_model,
@@ -335,10 +339,10 @@ class SWADistLoss(ReplicaLoss):
                 # add model param to swa_model average, but keep it differentiable
                 p_swa.detach().copy_(
                     swa_model.avg_fn(p_swa.detach(), p_model.to(device),
-                                     torch.tensor(len(self.epoch_models)).to(device))
+                                     torch.tensor(len(self.epoch_models)).detach().to(device))
                 )
 
-        output = swa_model(x)
+            output = swa_model(x)
 
         mean_output = self.replica_mean_output(x, output)
 
@@ -358,9 +362,6 @@ class SWADistLoss(ReplicaLoss):
         recent `max_averaged` models are included in the average.
 
         """
-
-        # TODO: don't put model on cpu before calling this
-        # TODO: instead, move epoch_models to gpu as needed
 
         if self.debug:
             print(f'\nRank {self.rank} updating `AveragedModel` params '

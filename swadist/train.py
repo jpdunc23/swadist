@@ -411,7 +411,7 @@ class Trainer():
             else:
                 print(f'Starting SWA phase...\n')
 
-        self.model.to('cpu')
+        # self.model.to('cpu')
 
         # create the model for SWA
         if self.swadist:
@@ -436,7 +436,7 @@ class Trainer():
             self.swa_model = torch.optim.swa_utils.AveragedModel(self.model)
             self.swa_model.update_parameters(self.model)
 
-        self.model.to(self.rank)
+        # self.model.to(self.rank)
 
         if isinstance(self.swa_scheduler, dict):
             self.swa_scheduler = torch.optim.swa_utils.SWALR(self.optimizer, **self.swa_scheduler)
@@ -619,7 +619,7 @@ class Trainer():
         # TODO: how often AveragedModel is updated should be up to user
         if self.in_swa and epoch_val:
 
-            self.model.to('cpu')
+            # self.model.to('cpu')
 
             # update the AveragedModel and batchnorm stats before every eval
 
@@ -631,16 +631,16 @@ class Trainer():
                 # update the AveragedModel and batchnorm stats before every eval
                 self.swa_model.update_parameters(self.model)
 
-            self.swa_model.to(self.device)
+            # self.swa_model.to(self.device)
 
             torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
 
         if self.in_swa:
             # move model to the cpu
-            self.model.to('cpu')
+            # self.model.to('cpu')
 
             # move swa_model to the gpu and eval
-            self.swa_model.to(self.device)
+            # self.swa_model.to(self.device)
             self.swa_model.eval()
 
         else:
@@ -704,10 +704,10 @@ class Trainer():
                                   f'({100.*(batch_idx + 1) / n_batches:.0f}%)',
                                   end=end)
 
-        if self.in_swa:
-            # move swa_model back to the cpu and model back to the gpu
-            self.swa_model.to('cpu')
-            self.model.to(self.rank)
+        # if self.in_swa:
+        #     # move swa_model back to the cpu and model back to the gpu
+        #     self.swa_model.to('cpu')
+        #     self.model.to(self.rank)
 
         if prints:
             print()

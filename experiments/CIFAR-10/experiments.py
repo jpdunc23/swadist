@@ -43,7 +43,7 @@ if __name__ == "__main__":
         'dataloader_kwargs': {
             'dataset': 'cifar10',
             'root_dir': datadir,
-            'num_workers': 2,
+            'num_workers': 4,
             'data_parallel': True,
         },
         'model_kwargs': {
@@ -69,7 +69,7 @@ if __name__ == "__main__":
             'swadist_kwargs': {
                 'sync_freq': 50,
                 'transform': 'softmax',
-                'max_averaged': 3,
+                'max_averaged': 5,
             },
             'validations_per_epoch': 4,
             # 'stopping_acc': 0.7,
@@ -77,11 +77,11 @@ if __name__ == "__main__":
         },
         'scheduler_kwargs': {
             'alpha': 0.25,
-            'decay_epochs': 15,
+            'decay_epochs': 50,
         },
         'swa_scheduler_kwargs': {
             'anneal_strategy': 'cos',
-            'anneal_epochs': 3,
+            'anneal_epochs': 10,
         },
     }
 
@@ -107,9 +107,9 @@ if __name__ == "__main__":
 
     # method_kwargs['swadist']['dataloader_kwargs'].update({ 'split_training': True })
     method_kwargs['swadist']['trainer_kwargs'].update({ 'name': 'swadist' })
-    method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 10,
+    method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 0,
                                                       'epochs_codist': 0,
-                                                      'epochs_swa': 40,
+                                                      'epochs_swa': 50,
                                                       'swadist': True })
 
     # method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
