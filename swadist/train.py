@@ -152,6 +152,7 @@ class Trainer():
               epochs_swa: int=0,
               swadist: bool=False,
               codist_kwargs: dict=None,
+              swadist_kwargs: dict=None,
               validations_per_epoch: int=None,
               stopping_acc: float=None,
               save: bool=False,
@@ -293,7 +294,10 @@ class Trainer():
                         hparams['swa_scheduler_anneal_strategy'] = \
                             self.swa_scheduler.anneal_func.__name__
 
-            self._swa(epochs_swa, codist_kwargs)
+            if swadist_kwargs is None:
+                swadist_kwargs = {}
+
+            self._swa(epochs_swa, swadist_kwargs)
 
         else:
             self.swa_scheduler = None
@@ -304,6 +308,7 @@ class Trainer():
 
         self.model = None
 
+        # TODO: add swadist_kwargs to hparams
         if self.epochs_codist > 0 or (self.epochs_swa > 0 and self.swadist):
             hparams['codist_sync_freq'] = codist_kwargs.get('sync_freq', 50)
             hparams['codist_loss_fn'] = codist_kwargs.get('loss_fn', self.loss_fn).__name__
@@ -390,9 +395,6 @@ class Trainer():
 
             self._train_epoch()
 
-        # if this is swadist, keep using CodistillationLoss
-        self.in_codist = self.swadist
-
 
     def _swa(self, epochs, swadist_kwargs):
         self.in_swa = True
@@ -403,11 +405,13 @@ class Trainer():
             else:
                 print(f'Starting SWA phase...\n')
 
-        # create the model for SWA
-        # TODO: may want to store AveragedModel on cpu when not in use
-        self.swa_model = torch.optim.swa_utils.AveragedModel(self.model)
+        self.model.to('cpu')
 
+        # create the model for SWA
         if self.swadist:
+
+            # if this is swadist, keep using CodistillationLoss
+            self.in_codist = True
 
             self.codist_loss_fn = None
 
@@ -416,10 +420,17 @@ class Trainer():
             # initialize self.codist_loss_fn
             self.swadist_loss_fn = SWADistLoss(loss_fn,
                                                self.model,
-                                               self.swa_model,
                                                self.rank,
                                                self.world_size,
                                                **swadist_kwargs)
+
+            self.swa_model = self.swadist_loss_fn.swa_model
+
+        else:
+            self.swa_model = torch.optim.swa_utils.AveragedModel(self.model)
+            self.swa_model.update_parameters(self.model)
+
+        self.model.to(self.rank)
 
         if isinstance(self.swa_scheduler, dict):
             self.swa_scheduler = torch.optim.swa_utils.SWALR(self.optimizer, **self.swa_scheduler)
@@ -458,7 +469,7 @@ class Trainer():
         acc = 0.
         metrics = {}
 
-        if self.ddp:
+        if self.train_loader.sampler.__class__.__name__ == 'DistributedSampler':
             # required so that shuffling changes across epochs when using
             # DistributedSampler
             self.train_loader.sampler.set_epoch(self.epoch)
@@ -600,17 +611,31 @@ class Trainer():
 
         # TODO: how often AveragedModel is updated should be up to user
         if self.in_swa and epoch_val:
+
+            self.model.to('cpu')
+
             # update the AveragedModel and batchnorm stats before every eval
-            self.swa_model.update_parameters(self.model)
 
             if self.swadist:
-                # update AveragedModel replicas synchronously
-                self.swadist_loss_fn.update_replicas()
+                # updates self.swa_model
+                self.swadist_loss_fn.update_swa_parameters()
+
+            else:
+                # update the AveragedModel and batchnorm stats before every eval
+                self.swa_model.update_parameters(self.model)
+
+            self.swa_model.to(self.device)
 
             torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
 
         if self.in_swa:
+            # move model to the cpu
+            self.model.to('cpu')
+
+            # move swa_model to the gpu and eval
+            self.swa_model.to(self.device)
             self.swa_model.eval()
+
         else:
             self.model.eval()
 
@@ -671,6 +696,11 @@ class Trainer():
                                   f'Batch: {batch_idx + 1}/{n_batches} '
                                   f'({100.*(batch_idx + 1) / n_batches:.0f}%)',
                                   end=end)
+
+        if self.in_swa:
+            # move swa_model back to the cpu and model back to the gpu
+            self.swa_model.to('cpu')
+            self.model.to(self.rank)
 
         if prints:
             print()

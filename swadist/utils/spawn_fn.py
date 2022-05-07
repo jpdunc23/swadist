@@ -140,4 +140,6 @@ def spawn_fn(rank: int,
     trainer.train(**train_kwargs)
 
     trainer.hparams['spawn_fn_seed'] = seed if seed is None else seed + rank
-    trainer.save(save_dir=train_kwargs.get('save_dir', None))
+
+    if save:
+        trainer.save(save_dir=train_kwargs.get('save_dir', None))
