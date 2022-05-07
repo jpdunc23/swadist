@@ -308,10 +308,16 @@ class Trainer():
 
         self.model = None
 
-        # TODO: add swadist_kwargs to hparams
-        if self.epochs_codist > 0 or (self.epochs_swa > 0 and self.swadist):
+        if self.epochs_codist > 0:
             hparams['codist_sync_freq'] = codist_kwargs.get('sync_freq', 50)
             hparams['codist_loss_fn'] = codist_kwargs.get('loss_fn', self.loss_fn).__name__
+            hparams['codist_transform'] = codist_kwargs.get('transform', None)
+
+        if self.epochs_swa > 0 and self.swadist:
+            hparams['swadist_sync_freq'] = swadist_kwargs.get('sync_freq', 50)
+            hparams['swadist_loss_fn'] = swadist_kwargs.get('loss_fn', self.loss_fn).__name__
+            hparams['swadist_transform'] = swadist_kwargs.get('transform', None)
+            hparams['swadist_max_averaged'] = swadist_kwargs.get('max_averaged', None)
 
         self.hparams = hparams
         self._log_hparam_metrics()
@@ -410,7 +416,7 @@ class Trainer():
         # create the model for SWA
         if self.swadist:
 
-            # if this is swadist, keep using CodistillationLoss
+            # keep using codistillation
             self.in_codist = True
 
             self.codist_loss_fn = None
@@ -470,8 +476,7 @@ class Trainer():
         metrics = {}
 
         if self.train_loader.sampler.__class__.__name__ == 'DistributedSampler':
-            # required so that shuffling changes across epochs when using
-            # DistributedSampler
+            # shuffles data across epochs when using DistributedSampler
             self.train_loader.sampler.set_epoch(self.epoch)
 
         # training loop
@@ -561,6 +566,7 @@ class Trainer():
         self.optimizer.zero_grad()
 
         # calculate the loss & gradients
+
         output = self.model(x)
 
         metrics = {
@@ -572,11 +578,12 @@ class Trainer():
 
             if self.in_swa:
                 metric_name = 'swadist_loss'
+                metrics[metric_name] = self.swadist_loss_fn(x)
+                # TODO: test this
+                # metrics[metric_name].backward()
             else:
                 metric_name = 'codist_loss'
-
-            _loss_fn = getattr(self, metric_name + '_fn')
-            metrics[metric_name] = _loss_fn(x, output)
+                metrics[metric_name] = self.codist_loss_fn(x, output)
 
             # backprop on mean of losses
             (0.5*(metrics[self.loss_fn.__name__] + metrics[metric_name])).backward()

@@ -44,6 +44,7 @@ if __name__ == "__main__":
             'dataset': 'cifar10',
             'root_dir': datadir,
             'num_workers': 2,
+            'data_parallel': True,
         },
         'model_kwargs': {
             'n_classes': 10,
@@ -65,7 +66,13 @@ if __name__ == "__main__":
                 'sync_freq': 50,
                 'transform': 'softmax',
             },
+            'swadist_kwargs': {
+                'sync_freq': 50,
+                'transform': 'softmax',
+                'max_averaged': 3,
+            },
             'validations_per_epoch': 4,
+            # 'stopping_acc': 0.7,
             'save': True,
         },
         'scheduler_kwargs': {
@@ -95,31 +102,31 @@ if __name__ == "__main__":
     seed = int((datetime.date.today() - datetime.date(2022, 4, 11)).total_seconds())
     print(f'seed: {seed}')
 
-    methods = ['sgd', 'swa', 'codist', 'codistswa', 'swadist']
+    methods = ['swadist', 'sgd', 'swa', 'codist', 'codistswa']
     method_kwargs = { method: deepcopy(common_kwargs) for method in methods }
 
-    method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
-    method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
-    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 15, 'codist_kwargs': None })
-
-    method_kwargs['swa']['dataloader_kwargs'].update({ 'data_parallel': True })
-    method_kwargs['swa']['trainer_kwargs'].update({ 'name': 'swa' })
-    method_kwargs['swa']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_swa': 5, 'codist_kwargs': None })
-
-    method_kwargs['codist']['dataloader_kwargs'].update({ 'split_training': True })
-    method_kwargs['codist']['trainer_kwargs'].update({ 'name': 'codist' })
-    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 5, 'epochs_codist': 10 })
-
-    method_kwargs['codistswa']['dataloader_kwargs'].update({ 'split_training': True })
-    method_kwargs['codistswa']['trainer_kwargs'].update({ 'name': 'codistswa' })
-    method_kwargs['codistswa']['train_kwargs'].update({ 'epochs_sgd': 5, 'epochs_codist': 5, 'epochs_swa': 5 })
-
-    method_kwargs['swadist']['dataloader_kwargs'].update({ 'split_training': True })
+    # method_kwargs['swadist']['dataloader_kwargs'].update({ 'split_training': True })
     method_kwargs['swadist']['trainer_kwargs'].update({ 'name': 'swadist' })
-    method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 5,
-                                                      'epochs_codist': 5,
-                                                      'epochs_swa': 5,
+    method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 10,
+                                                      'epochs_codist': 0,
+                                                      'epochs_swa': 40,
                                                       'swadist': True })
+
+    # method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
+    method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
+    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 50, 'codist_kwargs': None })
+
+    # method_kwargs['codist']['dataloader_kwargs'].update({ 'split_training': True })
+    method_kwargs['codist']['trainer_kwargs'].update({ 'name': 'codist' })
+    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 40 })
+
+    # method_kwargs['swa']['dataloader_kwargs'].update({ 'data_parallel': True })
+    method_kwargs['swa']['trainer_kwargs'].update({ 'name': 'swa' })
+    method_kwargs['swa']['train_kwargs'].update({ 'epochs_sgd': 40, 'epochs_swa': 10, 'codist_kwargs': None })
+
+    # method_kwargs['codistswa']['dataloader_kwargs'].update({ 'split_training': True })
+    method_kwargs['codistswa']['trainer_kwargs'].update({ 'name': 'codistswa' })
+    method_kwargs['codistswa']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 30, 'epochs_swa': 10 })
 
     for bs, lr, mo in zip(batch_size, lr0, momentum):
 
@@ -133,12 +140,12 @@ if __name__ == "__main__":
 
             kwargs['dataloader_kwargs']['batch_size'] = bs // world_size
             kwargs['optimizer_kwargs'].update({ 'lr': lr, 'momentum': mo })
-            kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
+            # kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
 
-            if method in ['sgd', 'codist']:
-                swa_scheduler_kwargs = None
-            else:
-                swa_scheduler_kwargs = kwargs['swa_scheduler_kwargs']
+            # if method in ['sgd', 'codist']:
+            #     swa_scheduler_kwargs = None
+            # else:
+            #     swa_scheduler_kwargs = kwargs['swa_scheduler_kwargs']
 
             args = (world_size,
                     kwargs['dataloader_kwargs'],
@@ -147,7 +154,7 @@ if __name__ == "__main__":
                     trainer_kwargs,
                     kwargs['train_kwargs'],
                     kwargs['scheduler_kwargs'],
-                    swa_scheduler_kwargs,
+                    None, # swa_scheduler_kwargs,
                     seed)
 
             tic = time.perf_counter()
