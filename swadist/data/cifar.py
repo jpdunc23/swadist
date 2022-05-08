@@ -14,7 +14,7 @@ __all__ = ['get_cifar10']
 
 
 def get_cifar10(root_dir='./data',
-                download=False,
+                download=True,
                 validation=True,
                 validation_prop=0.1,
                 test=True,

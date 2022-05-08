@@ -20,8 +20,8 @@ setuptools.setup(
     url='https://github.com/jpdunc23/swadist',
     packages=setuptools.find_packages(exclude=['tests']),
     install_requires=[
-        'torch>=1.6',
-        'numpy',
+        'torch>=1.11',
+        'tensorboard>=2.8.0',
     ],
     python_requires='>=3.6',
     classifiers=[
