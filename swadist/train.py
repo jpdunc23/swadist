@@ -116,12 +116,18 @@ class Trainer():
         # the below are set during training
 
         self.hparams = None
+
         self.epochs_sgd = 0
         self.epochs_codist = 0
         self.epochs_swa = 0
+
+        self.in_sgd = None
         self.in_codist = None
+        self.in_swadist = None
         self.in_swa = None
+
         self.val_freq = None
+        self.stop_stall_n_epochs = None
         self.stopping_acc = None
         self.stop_early = None
 
@@ -155,6 +161,7 @@ class Trainer():
               swadist_kwargs: dict=None,
               validations_per_epoch: int=None,
               stopping_acc: float=None,
+              stop_stall_n_epochs: int=5,
               save: bool=False,
               save_dir: str=None):
         """
@@ -203,6 +210,9 @@ class Trainer():
         self.in_codist = False
         self.in_swa = False
 
+        self.epochs_codist = epochs_codist
+        self.epochs_swa = epochs_swa
+
         if validations_per_epoch:
             n_valid = min(self.n_batches, validations_per_epoch)
             if n_valid < validations_per_epoch:
@@ -210,6 +220,7 @@ class Trainer():
                               f'have {n_valid} batches. Using validations_per_epoch={n_valid}.')
             self.val_freq = self.n_batches // n_valid
 
+        self.stop_stall_n_epochs = stop_stall_n_epochs
         self.stopping_acc = stopping_acc
         self.stop_early = False
 
@@ -265,7 +276,7 @@ class Trainer():
 
         # codistillation
 
-        if not self.stop_early and epochs_codist > 0:
+        if epochs_codist > 0:
 
             if codist_kwargs is None:
                 codist_kwargs = {}
@@ -274,7 +285,7 @@ class Trainer():
 
         # stochastic weight averaging
 
-        if not self.stop_early and epochs_swa > 0:
+        if epochs_swa > 0:
 
             hparams['swadist'] = self.swadist
 
@@ -331,39 +342,67 @@ class Trainer():
 
     def _stop_early(self):
 
-        if self.stopping_acc is None or self.stop_early:
-            return self.stop_early
+        stopping_acc = self.stopping_acc
 
-        acc = self.step_valid_metrics['acc'][-1]
+        # stop early training has stalled out (avg acc of most recent
+        # `stop_stall_n_epochs` epochs is less than that of n_avg+1 epochs ago)
+        check_for_stall = (
+            self.stop_stall_n_epochs is not None and
+            ((self.in_sgd and
+              self.epochs_codist + self.epochs_swa > 0 and
+              self.epochs_sgd >= 10) or
+             (self.in_codist and
+              self.epochs_swa > 0 and
+              self.epochs_codist >= 10))
+        )
+
+        if check_for_stall:
+            n_avg = self.stop_stall_n_epochs
+            acc_mean = np.mean(self.epoch_valid_metrics['acc'][-n_avg:])
+            acc = self.epoch_valid_metrics['acc'][-(n_avg+1)] - acc_mean
+            stopping_acc = 0.
+
+        elif self.stopping_acc is None or self.stop_early:
+            # already stopped early
+            return
+
+        else:
+            acc = self.step_valid_metrics['acc'][-1]
 
         if not self.ddp and is_multiproc():
-            # get average vallidation acc across ranks
+            # get average validation acc across ranks
             _, acc = all_reduce(torch.tensor(acc, device=self.device),
-                                op=torch.distributed.ReduceOp.AVG)
+                                op=torch.distributed.ReduceOp.AVG,
+                                async_op=False)
             acc = acc.cpu().item()
 
-        if acc >= self.stopping_acc:
+        if acc >= stopping_acc:
 
             self.stop_early = True
 
-            if self.prints and not self.ddp and is_multiproc():
-                print(f'\n\nValidation accuracy target reached '
-                      f'(mean accuracy across ranks after {self.step} steps: {acc:.6f}). '
-                      f'Caching current model and stopping after epoch {self.epoch}.')
+            if check_for_stall:
+                msg = (f'\n\n{"sgd" if self.in_sgd else "codist"} stalled (mean accuracy '
+                       f'of last {n_avg} epochs was {acc:.6f} less than the one before, '
+                       'on average across all ranks). '
+                       f'Moving onto the next phase of training.')
+            else:
+                msg = ('\n\nValidation accuracy target reached '
+                       f'(mean accuracy across ranks after {self.step} steps: {acc:.6f}). '
+                       'Saving current model and stopping.')
 
-            elif self.prints:
-                print(f'\n\nValidation accuracy target reached '
-                      f'(accuracy after {self.step} steps: {acc:.6f}). '
-                      f'Caching current model and stopping after epoch {self.epoch}.')
+            if self.prints:
 
-            self.model.cpu()
-            self.final_model = deepcopy(self.model)
-            self.model.to(self.device)
+                print(msg)
 
-        return self.stop_early
+            if not check_for_stall:
+                self.model.cpu()
+                self.final_model = deepcopy(self.model)
+                self.model.to(self.device)
 
 
     def _sgd(self, epochs):
+
+        self.in_sgd = True
 
         # epoch loop
         for _ in range(epochs):
@@ -375,9 +414,16 @@ class Trainer():
 
             self._train_epoch()
 
+        self.in_sgd = False
+
+        # in case sgd stalled out
+        if self.epochs_codist + self.epochs_swa > 0:
+            self.stop_early = False
+
 
     def _codist(self, epochs, codist_kwargs):
         self.in_codist = True
+        self.epochs_codist = 0
 
         if epochs > 0 and self.prints:
             print(f'Starting codistillation phase...\n')
@@ -401,25 +447,32 @@ class Trainer():
 
             self._train_epoch()
 
+        self.codist_loss_fn = None
+        self.in_codist = False
+
+        # in case codist stalled out
+        if self.epochs_swa > 0:
+            self.stop_early = False
+
 
     def _swa(self, epochs, swadist_kwargs):
-        self.in_swa = True
+
+        if self.swadist:
+            self.in_swadist = True
+            phase_name = 'SWADist'
+        else:
+            self.in_swa = True
+            phase_name = 'SWA'
+
+        self.epochs_swa = 0
 
         if self.prints:
-            if self.swadist:
-                print(f'Starting SWADist phase...\n')
-            else:
-                print(f'Starting SWA phase...\n')
+            print(f'Starting {phase_name} phase...\n')
 
         # self.model.to('cpu')
 
         # create the model for SWA
-        if self.swadist:
-
-            # keep using codistillation
-            self.in_codist = True
-
-            self.codist_loss_fn = None
+        if self.in_swadist:
 
             loss_fn = swadist_kwargs.get('loss_fn', self.loss_fn)
 
@@ -450,6 +503,10 @@ class Trainer():
             self.epochs_swa += 1
 
             self._train_epoch()
+
+        self.swadist_loss_fn = None
+        self.in_swadist = False
+        self.in_swa = False
 
 
     def _save_metrics(self, metrics, what='step', stage='train'):
@@ -574,19 +631,18 @@ class Trainer():
             'acc': accuracy(output, y),
         }
 
-        if self.in_codist:
-
-            if self.in_swa:
-                metric_name = 'swadist_loss'
-                metrics[metric_name] = self.swadist_loss_fn(x)
-                # TODO: test this
-                # metrics[metric_name].backward()
-            else:
-                metric_name = 'codist_loss'
-                metrics[metric_name] = self.codist_loss_fn(x, output)
+        if self.in_swadist:
+            metrics['swadist_loss'] = self.swadist_loss_fn(x)
 
             # backprop on mean of losses
-            (0.5*(metrics[self.loss_fn.__name__] + metrics[metric_name])).backward()
+            (0.5*(metrics[self.loss_fn.__name__] + metrics['swadist_loss'])).backward()
+
+        elif self.in_codist:
+
+            metrics['codist_loss'] = self.codist_loss_fn(x, output)
+
+            # backprop on mean of losses
+            (0.5*(metrics[self.loss_fn.__name__] + metrics['codist_loss'])).backward()
 
         else:
             metrics[self.loss_fn.__name__].backward()
@@ -726,8 +782,8 @@ class Trainer():
             self._log_together(what='epoch')
             self._log_separate(what='epoch')
 
-        # check if we should stop early
-        self._stop_early()
+            # check if we should stop early
+            self._stop_early()
 
 
     def _log_separate(self, what='epoch'):

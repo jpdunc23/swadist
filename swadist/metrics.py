@@ -82,7 +82,7 @@ class ReplicaLoss(object):
                  rank,
                  world_size,
                  sync_freq=50,
-                 transform=None,
+                 transform='softmax',
                  async_op=True,
                  debug=False):
 
@@ -208,7 +208,7 @@ class CodistillationLoss(ReplicaLoss):
                  rank,
                  world_size,
                  sync_freq=50,
-                 transform=None,
+                 transform='softmax',
                  async_op=True,
                  debug=False):
         self.__name__ = 'CodistillationLoss'
@@ -258,7 +258,7 @@ class SWADistLoss(ReplicaLoss):
                  world_size,
                  sync_freq=50,
                  max_averaged=None,
-                 transform=None,
+                 transform='softmax',
                  async_op=True,
                  debug=False):
         self.__name__ = 'SWADistLoss'
