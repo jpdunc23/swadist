@@ -56,7 +56,7 @@ def get_imagenet(root_dir='./data',
 
     if test:
         datasets['test'] = ImageNet(root=root_dir,
-                                    split='train',
+                                    split='val',
                                     transform=eval_transform)
 
     return datasets
