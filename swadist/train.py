@@ -632,7 +632,8 @@ class Trainer():
         }
 
         if self.in_swadist:
-            metrics['swadist_loss'] = self.swadist_loss_fn(x)
+
+            metrics['swadist_loss'] = self.swadist_loss_fn(x, output)
 
             # backprop on mean of losses
             (0.5*(metrics[self.loss_fn.__name__] + metrics['swadist_loss'])).backward()

@@ -78,7 +78,7 @@ class ReplicaLoss(object):
     """
     def __init__(self,
                  loss_fn,
-                 model,
+                 _model,
                  rank,
                  world_size,
                  sync_freq=50,
@@ -87,7 +87,7 @@ class ReplicaLoss(object):
                  debug=False):
 
         self.loss_fn = loss_fn
-        self.model = model
+        self._model = _model
         self.rank = rank
         self.world_size = world_size
         self.sync_freq = sync_freq
@@ -101,9 +101,9 @@ class ReplicaLoss(object):
 
         for i in range(self.world_size):
             if i == self.rank:
-                self.replicas.append(self.model)
+                self.replicas.append(self._model)
             else:
-                self.replicas.append(deepcopy(self.model))
+                self.replicas.append(deepcopy(self._model))
                 for param in self.replicas[i].parameters():
                     param.detach()
 
@@ -211,6 +211,7 @@ class CodistillationLoss(ReplicaLoss):
                  transform='softmax',
                  async_op=True,
                  debug=False):
+        self.model = model
         self.__name__ = 'CodistillationLoss'
         super(CodistillationLoss, self).__init__(loss_fn,
                                                  model,
@@ -258,6 +259,7 @@ class SWADistLoss(ReplicaLoss):
                  world_size,
                  sync_freq=50,
                  max_averaged=None,
+                 swa_replicas=False,
                  transform='softmax',
                  async_op=True,
                  debug=False):
@@ -275,21 +277,28 @@ class SWADistLoss(ReplicaLoss):
         else:
             max_averaged = torch.tensor(self.max_avgd)
 
-            def avg_fn(averaged_model_parameter, model_parameter, num_averaged):
+            def avg_fn(averaged_modelparameter, _modelparameter, num_averaged):
 
                 max_averaged.to(num_averaged.device)
 
                 if num_averaged < max_averaged:
-                    return averaged_model_parameter + \
-                        (model_parameter - averaged_model_parameter) / (num_averaged + 1)
+                    return averaged_modelparameter + \
+                        (_modelparameter - averaged_modelparameter) / (num_averaged + 1)
                 else:
-                    # model_parameter is new model - oldest model in current avg
-                    return averaged_model_parameter + model_parameter / max_averaged
+                    # _modelparameter is new model - oldest model in current avg
+                    return averaged_modelparameter + _modelparameter / max_averaged
 
             self.swa_model = torch.optim.swa_utils.AveragedModel(model, avg_fn=avg_fn)
 
+        self.model = model
+
+        if swa_replicas:
+            _model = self.swa_model
+        else:
+            _model = self.model
+
         super(SWADistLoss, self).__init__(loss_fn,
-                                          model,
+                                          _model,
                                           rank,
                                           world_size,
                                           sync_freq,
@@ -300,50 +309,18 @@ class SWADistLoss(ReplicaLoss):
         # stores up to `max_averaged` recent epoch-end models
         self.epoch_models = []
 
-        # sync swa_model replicas
-        self.update_swa_parameters()
 
-
-    def __call__(self, x, output=None):
-        """Calculate SWADist component of loss, i.e. `loss_fn` applied to the output
-        from `swa_model` updated with the current state of `model` and the mean
-        of the `model` outputs from the other ranks in the collective.
+    def __call__(self, x, output):
+        """Calculate SWADist component of loss.
 
         Parameters
         __________
         x: torch.Tensor
             A batch of input observations.
         output: torch.Tensor
-            A batch of model outputs from this rank's model. If None, we create
-            the output from the swa_model instead.
+            A batch of model outputs from this rank's model.
 
         """
-
-        if output is None:
-            # output comes from swa_model
-
-            # with torch.no_grad():
-            # copy swa_model
-            # TODO: keep swa model on the gpu?
-            swa_model = deepcopy(self.swa_model).to(self.rank)
-
-            for p_swa, p_model, p_old in self._zip_params(swa_model,
-                                                          self.model,
-                                                          self.epoch_models[0]):
-
-                device = p_swa.device
-
-                if self.max_avgd is not None and len(self.epoch_models) == self.max_avgd:
-                    p_model = p_model.to(device) - p_old.detach().to(device)
-
-                # add model param to swa_model average, but keep it differentiable
-                p_swa.detach().copy_(
-                    swa_model.avg_fn(p_swa.detach(), p_model.to(device),
-                                     torch.tensor(len(self.epoch_models)).detach().to(device))
-                )
-
-            output = swa_model(x)
-
         mean_output = self.replica_mean_output(x, output)
 
         return self.loss_fn(output, mean_output)
