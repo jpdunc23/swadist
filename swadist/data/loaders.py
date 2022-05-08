@@ -9,32 +9,33 @@ from torch.utils.data import RandomSampler, SubsetRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from .cifar import get_cifar10
+from .imagnet import get_imagenet
 
 
 __all__ = ['get_dataloaders']
 
 
 """Dictionary of data getters defined in `.data`. Each of the functions in this
-dict should be able to accept the parameters 'root_dir', 'download',
-'validation', and 'test' and should return a dict of datasets with keys among
-'train' (required), 'validation', and 'test'.
+dict should be able to accept the parameters 'root_dir', 'validation', and
+'test' and should return a dict of datasets with keys among 'train' (required),
+'validation', and 'test'.
 
 """
 _data_getters = {
     'cifar10' : get_cifar10,
+    'imagenet' : get_imagenet,
 }
 
 
 def get_dataloaders(dataset,
                     batch_size,
                     root_dir='./data',
-                    download=False,
                     validation=True,
                     test=False,
                     split_training=False,
+                    data_parallel=False,
                     world_size=1,
                     rank=0,
-                    data_parallel=False,
                     getter_kwargs=None,
                     **kwargs):
     """A generic data loader
@@ -72,7 +73,6 @@ def get_dataloaders(dataset,
 
     getter_kwargs.update({
         'root_dir': root_dir,
-        'download': download,
         'validation': validation,
         'test': test
     })
