@@ -4,6 +4,7 @@
 
 import os
 import time
+import pathlib
 import argparse
 import datetime
 
@@ -26,6 +27,9 @@ if __name__ == "__main__":
     datadir = args.datadir
     logdir = args.logdir
     savedir = args.savedir
+
+    if not os.path.exists(savedir):
+        pathlib.Path(savedir).mkdir(parents=True, exist_ok=True)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -72,16 +76,16 @@ if __name__ == "__main__":
                 'max_averaged': 5,
             },
             'validations_per_epoch': 4,
-            # 'stopping_acc': 0.7,
+            'stopping_acc': 0.75,
             'save': True,
         },
         'scheduler_kwargs': {
             'alpha': 0.25,
-            'decay_epochs': 50,
+            'decay_epochs': 15,
         },
         'swa_scheduler_kwargs': {
             'anneal_strategy': 'cos',
-            'anneal_epochs': 10,
+            'anneal_epochs': 5,
         },
     }
 
@@ -140,12 +144,12 @@ if __name__ == "__main__":
 
             kwargs['dataloader_kwargs']['batch_size'] = bs // world_size
             kwargs['optimizer_kwargs'].update({ 'lr': lr, 'momentum': mo })
-            # kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
+            kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
 
-            # if method in ['sgd', 'codist']:
-            #     swa_scheduler_kwargs = None
-            # else:
-            #     swa_scheduler_kwargs = kwargs['swa_scheduler_kwargs']
+            if method not in ['swa', 'codistswa']:
+                swa_scheduler_kwargs = None
+            else:
+                swa_scheduler_kwargs = kwargs['swa_scheduler_kwargs']
 
             args = (world_size,
                     kwargs['dataloader_kwargs'],
@@ -154,7 +158,7 @@ if __name__ == "__main__":
                     trainer_kwargs,
                     kwargs['train_kwargs'],
                     kwargs['scheduler_kwargs'],
-                    None, # swa_scheduler_kwargs,
+                    swa_scheduler_kwargs,
                     seed)
 
             tic = time.perf_counter()
