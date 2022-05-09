@@ -9,7 +9,7 @@ from torch.utils.data import RandomSampler, SubsetRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from .cifar import get_cifar10
-from .imagnet import get_imagenet
+from .imagenet import get_imagenet
 
 
 __all__ = ['get_dataloaders']
