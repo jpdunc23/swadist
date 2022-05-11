@@ -10,6 +10,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from .cifar import get_cifar10
 from .imagenet import get_imagenet
+from .fashion import get_fashionmnist
 
 
 __all__ = ['get_dataloaders']
@@ -24,6 +25,7 @@ dict should be able to accept the parameters 'root_dir', 'validation', and
 _data_getters = {
     'cifar10' : get_cifar10,
     'imagenet' : get_imagenet,
+    'fashionmnist' : get_fashionmnist,
 }
 
 
