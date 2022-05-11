@@ -5,6 +5,7 @@ import warnings
 import itertools
 
 from copy import deepcopy
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -184,7 +185,8 @@ class ReplicaLoss(object):
         if self._handle.is_completed():
 
             if self.debug:
-                print(f'\nRank {self.rank} `update_replicas` at {self.__name__} step {self.step}')
+                print(f'\nRank {self.rank} `update_replicas`: '
+                      f'async handle complete at {self.__name__} step {self.step}')
 
             # update the replicas' parameters
             for i, flat_params in enumerate(self._flat_params_list):
@@ -265,35 +267,27 @@ class SWADistLoss(ReplicaLoss):
                  debug=False):
         self.__name__ = 'SWADistLoss'
 
+        self.rank = rank
+        self.model = model
         self.max_avgd = max_averaged
+        self.swa_replicas = swa_replicas
 
         if self.max_avgd is not None and self.max_avgd <= 0:
             self.max_avgd = None
 
         # create the AveragedModel
-        if self.max_avgd is None:
-            self.swa_model = torch.optim.swa_utils.AveragedModel(model)
-
+        if self.max_avgd is not None:
+            avg_fn = partial(self._avg_fn,
+                             max_averaged=torch.tensor(self.max_avgd, dtype=torch.long))
         else:
-            max_averaged = torch.tensor(self.max_avgd)
+            avg_fn = None
 
-            def avg_fn(averaged_modelparameter, _modelparameter, num_averaged):
+        self.swa_model = torch.optim.swa_utils.AveragedModel(model, avg_fn=avg_fn)
 
-                max_averaged.to(num_averaged.device)
-
-                if num_averaged < max_averaged:
-                    return averaged_modelparameter + \
-                        (_modelparameter - averaged_modelparameter) / (num_averaged + 1)
-                else:
-                    # _modelparameter is new model - oldest model in current avg
-                    return averaged_modelparameter + _modelparameter / max_averaged
-
-            self.swa_model = torch.optim.swa_utils.AveragedModel(model, avg_fn=avg_fn)
-
-        self.model = model
-
-        if swa_replicas:
-            _model = self.swa_model
+        if self.swa_replicas:
+            # between epochs, we'll update swa_model_cp with current self.model
+            # state immediately before syncing
+            _model = self._cp_swa_model()
         else:
             _model = self.model
 
@@ -310,6 +304,49 @@ class SWADistLoss(ReplicaLoss):
         self.epoch_models = []
 
 
+    @staticmethod
+    def _avg_fn(averaged_modelparameter,
+                _modelparameter,
+                num_averaged,
+                max_averaged=None):
+        """Like the default torch.optim.swa_utils.AveragedModel.avg_fn, but handles
+        windowed averaging.
+
+        """
+
+        if max_averaged is not None:
+            max_averaged.to(num_averaged.device)
+
+        if max_averaged is None or num_averaged < max_averaged:
+            return averaged_modelparameter + \
+                (_modelparameter - averaged_modelparameter) / (num_averaged + 1)
+        else:
+            # _modelparameter is new model - oldest model in current avg
+            return averaged_modelparameter + _modelparameter / max_averaged
+
+
+    def _cp_swa_model(self):
+        """Returns a modifield copy of `self.swa_model`. Used at initialization and
+        whenever `update_swa_parameters` is called.
+
+        """
+
+        # in between we'll update avg params of the swa_model cp before syncing replicas
+        swa_model_cp = deepcopy(self.swa_model)
+
+        # pretend current swa_model state is the starting point
+        n_averaged = torch.tensor(1, dtype=torch.long, device=self.rank)
+        swa_model_cp.register_buffer('n_averaged', n_averaged)
+
+        # swa_model_cp will average batch normalization buffers as training proceeds
+        swa_model_cp.use_buffers = True
+
+        # the avg will be over the model states at all the sync points during the epoch
+        swa_model_cp.avg_fn = partial(self._avg_fn, max_averaged=None)
+
+        return swa_model_cp
+
+
     def __call__(self, x, output):
         """Calculate SWADist component of loss.
 
@@ -321,12 +358,19 @@ class SWADistLoss(ReplicaLoss):
             A batch of model outputs from this rank's model.
 
         """
+        if self.swa_replicas:
+            # update swa_model_cp at every training step
+            self.replicas[self.rank].update_parameters(self.model)
+
         mean_output = self.replica_mean_output(x, output)
 
         return self.loss_fn(output, mean_output)
 
 
     def _zip_params(self, *models):
+        """Input should never include swa_model.
+
+        """
         params = [(itertools.chain(m.parameters(), m.buffers())
                    if self.swa_model.use_buffers else m.parameters())
                   for m in models if m is not None]
@@ -335,11 +379,11 @@ class SWADistLoss(ReplicaLoss):
 
     def update_swa_parameters(self):
         """Updates this rank's `AveragedModel` with the current parameters of
-        `self.model`. If `self.max_avgd` is not None, then only the most
-        recent `max_averaged` models are included in the average.
+        `self.model`. If `self.max_avgd` is not None, then only the most recent
+        `max_averaged` models are included in the average. Called whenever
+        `Trainer.evaluate` is called.
 
         """
-
         if self.debug:
             print(f'\nRank {self.rank} updating `AveragedModel` params '
                   f'x{self.swa_model.n_averaged + 1}')
@@ -378,3 +422,5 @@ class SWADistLoss(ReplicaLoss):
             if self.max_avgd is not None:
                 self.epoch_models.append(deepcopy(self.model))
 
+        if self.swa_replicas:
+            self.replicas[self.rank] = self._cp_swa_model()
