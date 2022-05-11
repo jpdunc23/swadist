@@ -26,7 +26,8 @@ def spawn_fn(rank: int,
              ddp: bool=True,
              addr: str='127.0.0.1',
              port: str='6016',
-             backend: str=None):
+             backend: str=None,
+             min_rank=0):
     """A function that can be passed to `torch.multiprocessing.spawn` for distributed
     training of SWADist.
 
@@ -56,6 +57,8 @@ def spawn_fn(rank: int,
         If True, use `torch.distributed.DistributedDataParallel` when possible.
     addr, port, backend: str, optional
         Used to setup the process group.
+    min_rank: int, optional
+        The minimum rank to use.
 
     """
 
@@ -72,6 +75,8 @@ def spawn_fn(rank: int,
 
     if backend is None:
         backend = 'nccl' if cuda else 'gloo'
+
+    rank = min_rank + rank
 
     dist.init_process_group(backend, world_size=world_size, rank=rank)
 
@@ -129,6 +134,8 @@ def spawn_fn(rank: int,
     trainer_kwargs['rank'] = rank
     trainer_kwargs['device'] = device
     trainer_kwargs['world_size'] = world_size
+    trainer_kwargs['log'] = rank == min_rank and trainer_kwargs.get('log', False)
+    trainer_kwargs['prints'] = rank == min_rank and trainer_kwargs.get('prints', True)
 
     trainer = Trainer(**trainer_kwargs)
 
@@ -139,7 +146,7 @@ def spawn_fn(rank: int,
     # start training
     trainer.train(**train_kwargs)
 
-    trainer.hparams['spawn_fn_seed'] = seed if seed is None else seed + rank
+    trainer.hparams['spawn_fn_seed'] = seed
 
     if save:
         trainer.save(save_dir=train_kwargs.get('save_dir', None))

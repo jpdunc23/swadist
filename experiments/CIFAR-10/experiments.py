@@ -4,7 +4,6 @@
 
 import os
 import time
-import pathlib
 import argparse
 import datetime
 
@@ -27,9 +26,6 @@ if __name__ == "__main__":
     datadir = args.datadir
     logdir = args.logdir
     savedir = args.savedir
-
-    if not os.path.exists(savedir):
-        pathlib.Path(savedir).mkdir(parents=True, exist_ok=True)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -63,7 +59,7 @@ if __name__ == "__main__":
             'log': True,
             'log_dir': logdir,
             'save_dir': savedir,
-            'n_print': 10,
+            'n_print': 0,
         },
         'train_kwargs': {
             'codist_kwargs': {
@@ -75,13 +71,12 @@ if __name__ == "__main__":
                 'transform': 'softmax',
                 'max_averaged': 5,
             },
-            'validations_per_epoch': 4,
             'stopping_acc': 0.75,
             'save': True,
         },
         'scheduler_kwargs': {
             'alpha': 0.25,
-            'decay_epochs': 15,
+            'decay_epochs': 50,
         },
         'swa_scheduler_kwargs': {
             'anneal_strategy': 'cos',
@@ -113,28 +108,32 @@ if __name__ == "__main__":
     method_kwargs['swadist']['trainer_kwargs'].update({ 'name': 'swadist' })
     method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 0,
                                                       'epochs_codist': 0,
-                                                      'epochs_swa': 50,
+                                                      'epochs_swa': 200,
                                                       'swadist': True })
 
     # method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
     method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
-    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 50, 'codist_kwargs': None })
+    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 200, 'codist_kwargs': None })
 
     # method_kwargs['codist']['dataloader_kwargs'].update({ 'split_training': True })
     method_kwargs['codist']['trainer_kwargs'].update({ 'name': 'codist' })
-    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 40 })
+    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 190 })
 
     # method_kwargs['swa']['dataloader_kwargs'].update({ 'data_parallel': True })
     method_kwargs['swa']['trainer_kwargs'].update({ 'name': 'swa' })
-    method_kwargs['swa']['train_kwargs'].update({ 'epochs_sgd': 40, 'epochs_swa': 10, 'codist_kwargs': None })
+    method_kwargs['swa']['train_kwargs'].update({ 'epochs_sgd': 40, 'epochs_swa': 160, 'codist_kwargs': None })
 
     # method_kwargs['codistswa']['dataloader_kwargs'].update({ 'split_training': True })
     method_kwargs['codistswa']['trainer_kwargs'].update({ 'name': 'codistswa' })
-    method_kwargs['codistswa']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 30, 'epochs_swa': 10 })
+    method_kwargs['codistswa']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 180, 'epochs_swa': 10 })
 
     for bs, lr, mo in zip(batch_size, lr0, momentum):
 
         for method, kwargs in method_kwargs.items():
+
+            if bs == 64 and method in ['sgd', 'swadist']:
+                # TODO: remove after running once
+                continue
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
