@@ -362,19 +362,15 @@ class Trainer():
 
         if check_for_stall:
 
-            print(f'Rank {self.rank} checking for stall')
-
             n_avg = self.stop_stall_n_epochs
             acc_mean = torch.asarray(self.epoch_valid_metrics['acc'][-n_avg:]).mean()
             old_mean = torch.asarray(self.epoch_valid_metrics['acc'][-(2*n_avg):-n_avg]).mean()
             acc = acc_mean - old_mean
 
-            print(f'Rank {self.rank} acc difference (last {n_avg} epochs vs the {n_avg} before that): {acc:.6f}')
-
             if not self.ddp and is_multiproc():
 
                 # get avg mean acc difference across ranks
-                _, acc = all_reduce(acc,
+                _, acc = all_reduce(acc.to(self.rank),
                                     op=torch.distributed.ReduceOp.AVG,
                                     async_op=False)
 
