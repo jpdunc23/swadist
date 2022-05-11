@@ -330,6 +330,11 @@ class Trainer():
 
         if self.logs:
             self._log_metrics()
+
+        # all ranks because we all_reduce the metrics
+        self._log_hparam_metrics()
+
+        if self.logs:
             self.writer.close()
 
         if save:
@@ -532,6 +537,10 @@ class Trainer():
 
         metric_dict.setdefault('step', [])
         metric_dict['step'].append(self.step)
+
+        if what != 'step':
+            metric_dict.setdefault('epoch', [])
+            metric_dict['epoch'].append(self.step)
 
 
     def _train_epoch(self):
@@ -771,8 +780,8 @@ class Trainer():
         """
         train_metrics = getattr(self, f'{what}_train_metrics')
         valid_metrics = getattr(self, f'{what}_valid_metrics')
-        train_iter = train_metrics[what]
-        valid_iter = valid_metrics[what]
+        train_iters = train_metrics[what]
+        valid_iters = valid_metrics[what]
 
         for name, metrics in valid_metrics.items():
 
@@ -781,7 +790,7 @@ class Trainer():
                 if name != 'acc':
                     name = f'loss/{name}'
 
-                self.writer.add_scalar(f'{what} {name}/valid', metrics[i], valid_iter[i])
+                self.writer.add_scalar(f'{what} {name}/valid', metrics[i], valid_iters[i])
 
         for name, metrics in train_metrics.items():
 
@@ -790,47 +799,54 @@ class Trainer():
                 if name != 'acc':
                     name = f'loss/{name}'
 
-                self.writer.add_scalar(f'{what} {name}/train', metrics[i], train_iter[i])
+                self.writer.add_scalar(f'{what} {name}/train', metrics[i], train_iters[i])
 
 
     def _log_together(self, what='epoch'):
         """Log training and validation metrics together.
         """
-        train_metrics = torch.asarray(getattr(self, f'{what}_train_metrics'))
-        valid_metrics = torch.asarray(getattr(self, f'{what}_valid_metrics'))
-        train_iter = train_metrics[what]
-        valid_iter = valid_metrics[what]
+        train_metrics_dict = getattr(self, f'{what}_train_metrics')
+        valid_metrics_dict = getattr(self, f'{what}_valid_metrics')
+        valid_iters = valid_metrics_dict[what]
 
         # codist_loss and swadist_loss don't have validation metrics
-        for name in valid_metrics.keys():
+        for name in valid_metrics_dict.keys():
 
-            for i, _ in enumerate(valid_metrics):
+            if not name in train_metrics_dict.keys():
+                continue
 
-                train_metric = train_metrics[name][np.array(train_iter) == valid_iter[i]]
+            if what == 'step':
+                train_metrics = [metric for step, metric in zip(train_metrics_dict['step'],
+                                                                train_metrics_dict[name])
+                                 if step in valid_iters]
+            else:
+                train_metrics = train_metrics_dict[name]
 
-                scalars = { 'valid': valid_metrics[name][i],
-                            'train': train_metric }
+            for i, valid_metric in enumerate(valid_metrics_dict[name]):
+
+                scalars = {
+                    'valid': valid_metric,
+                    'train': train_metrics[i],
+                }
 
                 if name != 'acc':
                     name = f'loss/{name}'
 
-                self.writer.add_scalars(f'{what} {name}',
-                                        scalars,
-                                        valid_iter[i])
+                self.writer.add_scalars(f'{what} {name}', scalars, valid_iters[i])
 
 
     def _log_hparam_metrics(self):
         log_dict = {}
 
         for what in ['step', 'epoch']:
-            metric_dict = deepcopy(getattr(self, f'{what}_valid_metrics'))
+            metrics_dict = deepcopy(getattr(self, f'{what}_valid_metrics'))
 
             if what == 'step':
-                whats = metric_dict.pop('step')
+                whats = metrics_dict.pop('step')
             else:
-                whats = metric_dict.pop('epoch')
+                whats = metrics_dict.pop('epoch')
 
-            for name, metrics in metric_dict.items():
+            for name, metrics in metrics_dict.items():
 
                 # get best metrics after averaging over ranks
 
@@ -853,7 +869,8 @@ class Trainer():
                     f'hparams {what}/best validation {name}': metrics[best_idx],
                 })
 
-        self.writer.add_hparams(self.hparams, log_dict)
+        if self.logs:
+            self.writer.add_hparams(self.hparams, log_dict)
 
 
     def _log_metrics(self):
@@ -862,8 +879,6 @@ class Trainer():
 
         self._log_together()
         self._log_together('step')
-
-        self._log_hparam_metrics()
 
 
     def save(self,
