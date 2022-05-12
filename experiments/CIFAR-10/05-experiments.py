@@ -3,7 +3,6 @@
 """
 
 import os
-import time
 import argparse
 import datetime
 
@@ -131,10 +130,6 @@ if __name__ == "__main__":
 
         for method, kwargs in method_kwargs.items():
 
-            if bs == 64 and method in ['sgd', 'swadist']:
-                # TODO: remove after running once
-                continue
-
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -160,8 +155,4 @@ if __name__ == "__main__":
                     swa_scheduler_kwargs,
                     seed)
 
-            tic = time.perf_counter()
-
             torch.multiprocessing.spawn(spawn_fn, args=args, nprocs=world_size, join=True)
-
-            print(f'time elapsed: {(time.perf_counter() - tic) / 60:.2f}m')
