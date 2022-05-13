@@ -108,7 +108,7 @@ class ReplicaLoss(object):
                 self.replicas.append(self._model)
             else:
                 self.replicas.append(deepcopy(self._model))
-                for param in self.replicas[i].parameters():
+                for param in self.replicas[-1].parameters():
                     param.detach()
 
         # block on cpu until all ranks are ready
@@ -155,11 +155,12 @@ class ReplicaLoss(object):
             if self.transform is not None:
                 mean_output = _transform_fns[self.transform](mean_output)
 
+        assert not mean_output.requires_grad
+
         return mean_output
 
 
     def _all_gather_params(self, force=None):
-
         if force == None:
             force = self.async_op
 
@@ -167,7 +168,7 @@ class ReplicaLoss(object):
             print(f'\nRank {self.rank} `_all_gather_params` at {self.__name__} step {self.step}')
 
         # move params to gpu
-        params = [param.to(self.rank) for param in self.replicas[self.rank].parameters()]
+        params = [param.to(self.rank).detach() for param in self.replicas[self.rank].parameters()]
 
         # _flat_params_list[i] is a single Tensor with all params from rank i
         self._handle, self._flat_params_list = all_gather(*params,
@@ -180,24 +181,26 @@ class ReplicaLoss(object):
         finished.
 
         """
-        if self._handle is None:
-            # begin comm
-            self._all_gather_params(force=force)
+        with torch.no_grad():
 
-        # update params if comm has finished
-        if self._handle.is_completed():
+            if self._handle is None:
+                # begin comm
+                self._all_gather_params(force=force)
 
-            if self.debug:
-                print(f'\nRank {self.rank} `update_replicas`: '
-                      f'async handle complete at {self.__name__} step {self.step}')
+            # update params if comm has finished
+            if self._handle.is_completed():
 
-            # update the replicas' parameters
-            for i, flat_params in enumerate(self._flat_params_list):
-                if i != self.rank:
-                    vector_to_parameters(flat_params, self.replicas[i].parameters())
+                if self.debug:
+                    print(f'\nRank {self.rank} `update_replicas`: '
+                          f'async handle complete at {self.__name__} step {self.step}')
 
-            self._handle = None
-            self._flat_params_list = None
+                # update the replicas' parameters
+                for i, flat_params in enumerate(self._flat_params_list):
+                    if i != self.rank:
+                        vector_to_parameters(flat_params, self.replicas[i].parameters())
+
+                self._handle = None
+                self._flat_params_list = None
 
 
 
@@ -386,42 +389,43 @@ class SWADistLoss(ReplicaLoss):
         `Trainer.evaluate` is called.
 
         """
-        if self.debug:
-            print(f'\nRank {self.rank} updating `AveragedModel` params '
-                  f'x{self.swa_model.n_averaged + 1}')
-
-        if self.max_avgd is not None and len(self.epoch_models) == self.max_avgd:
-
-            # window averaged SWA
-
+        with torch.no_grad():
             if self.debug:
-                print(f'\nRank {self.rank} updating `AveragedModel` params (windowed)')
+                print(f'\nRank {self.rank} updating `AveragedModel` params '
+                      f'x{self.swa_model.n_averaged + 1}')
 
-            self.epoch_models.append(deepcopy(self.model))
+            if self.max_avgd is not None and len(self.epoch_models) == self.max_avgd:
 
-            # subtract oldest model's params from new model's params
-            self._model_subtract(self.epoch_models[0], self.model)
+                # window averaged SWA
 
-            # update the AveragedModel with the new model's remainder
-            self.swa_model.update_parameters(self.epoch_models[0])
+                if self.debug:
+                    print(f'\nRank {self.rank} updating `AveragedModel` params (windowed)')
 
-            # done with the oldest model, delete
-            del self.epoch_models[0]
-
-        else:
-            assert self.max_avgd is None or len(self.epoch_models) < self.max_avgd
-
-            # normal SWA
-            if self.debug:
-                print(f'\nRank {self.rank} updating `AveragedModel` params (standard)')
-
-            self.swa_model.update_parameters(self.model)
-
-            if self.max_avgd is not None:
                 self.epoch_models.append(deepcopy(self.model))
 
-        if self.swa_replicas:
-            self.replicas[self.rank] = self._cp_swa_model()
+                # subtract oldest model's params from new model's params
+                self._model_subtract(self.epoch_models[0], self.model)
+
+                # update the AveragedModel with the new model's remainder
+                self.swa_model.update_parameters(self.epoch_models[0])
+
+                # done with the oldest model, delete
+                del self.epoch_models[0]
+
+            else:
+                assert self.max_avgd is None or len(self.epoch_models) < self.max_avgd
+
+                # normal SWA
+                if self.debug:
+                    print(f'\nRank {self.rank} updating `AveragedModel` params (standard)')
+
+                self.swa_model.update_parameters(self.model)
+
+                if self.max_avgd is not None:
+                    self.epoch_models.append(deepcopy(self.model))
+
+            if self.swa_replicas:
+                self.replicas[self.rank] = self._cp_swa_model()
 
 
     def _zip_params(self, *models):
@@ -439,14 +443,14 @@ class SWADistLoss(ReplicaLoss):
         from_model and itself.
 
         """
+        with torch.no_grad():
+            # subtract oldest model's params from new model's params
+            for p_model0, p_model in self._zip_params(subtract_model, from_model):
+                device = p_model.device
+                p_model0.to(device)
+                p_model0.detach().mul_(-1).add_(p_model.detach())
 
-        # subtract oldest model's params from new model's params
-        for p_model0, p_model in self._zip_params(subtract_model, from_model):
-            device = p_model.device
-            p_model0.to(device)
-            p_model0.detach().mul_(-1).add_(p_model.detach())
-
-        return subtract_model
+            return subtract_model
 
 
     def _cp_swa_model(self):
@@ -454,10 +458,11 @@ class SWADistLoss(ReplicaLoss):
         whenever `update_swa_parameters` is called.
 
         """
-        # this cp will be updated with current self.model params right before sync
-        swa_model_cp = deepcopy(self.swa_model)
+        with torch.no_grad():
+            # this cp will be updated with current self.model params right before sync
+            swa_model_cp = deepcopy(self.swa_model)
 
-        # swa_model_cp will average batch normalization buffers as training proceeds
-        swa_model_cp.use_buffers = True
+            # swa_model_cp will average batch normalization buffers as training proceeds
+            swa_model_cp.use_buffers = True
 
         return swa_model_cp

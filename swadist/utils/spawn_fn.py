@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import numpy as np
 
@@ -66,10 +67,6 @@ def spawn_fn(rank: int,
 
     cuda = torch.cuda.is_available()
 
-    if cuda:
-        # block until all ranks are ready
-        torch.cuda.synchronize()
-
     # initialize the process group
     os.environ['MASTER_ADDR'] = addr
     os.environ['MASTER_PORT'] = port
@@ -77,14 +74,12 @@ def spawn_fn(rank: int,
     if backend is None:
         backend = 'nccl' if cuda else 'gloo'
 
-    if rank == 0:
-        print('Starting training from spawn_fn...')
-
     dist.init_process_group(backend, world_size=world_size, rank=rank)
 
     # pin process to a single cuda device
     if cuda:
         torch.cuda.set_device(rank)
+        torch.cuda.synchronize()
         device = 'cuda'
     else:
         device = 'cpu'
@@ -144,6 +139,13 @@ def spawn_fn(rank: int,
     # we'll save after adding the seed
     save = train_kwargs.get('save', False)
     train_kwargs['save'] = False
+
+    if cuda:
+        # block until all ranks are ready
+        torch.cuda.synchronize()
+
+    if rank == 0:
+        print('Starting training from spawn_fn...')
 
     # start training
     trainer.train(**train_kwargs)

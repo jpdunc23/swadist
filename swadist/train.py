@@ -5,7 +5,6 @@ Adapted from https://github.com/Yu-Group/adaptive-wavelets/blob/master/awave/uti
 import os
 import time
 import pathlib
-import warnings
 
 from copy import deepcopy
 from datetime import datetime
@@ -555,29 +554,30 @@ class Trainer():
 
 
     def _cache_metrics(self, metrics, what='step', stage='train'):
-        metrics_dict = getattr(self, f'{what}_{stage}_metrics')
+        with torch.inference_mode():
+            metrics_dict = getattr(self, f'{what}_{stage}_metrics')
 
-        metrics_dict.setdefault('metrics', {})
-        metrics_dict.setdefault('steps', {})
-        if what == 'epoch':
-            metrics_dict.setdefault('epochs', {})
-
-        # save the step metrics
-        for name, metric in metrics.items():
-
-            metric_dict = metrics_dict['metrics']
-            step_dict = metrics_dict['steps']
-
-            metric_dict.setdefault(name, [])
-            metric_dict[name].append(metric)
-
-            step_dict.setdefault(name, [])
-            step_dict[name].append(self.step)
-
+            metrics_dict.setdefault('metrics', {})
+            metrics_dict.setdefault('steps', {})
             if what == 'epoch':
-                epoch_dict = metrics_dict['epochs']
-                epoch_dict.setdefault(name, [])
-                epoch_dict[name].append(self.epoch)
+                metrics_dict.setdefault('epochs', {})
+
+            # save the step metrics
+            for name, metric in metrics.items():
+
+                metric_dict = metrics_dict['metrics']
+                step_dict = metrics_dict['steps']
+
+                metric_dict.setdefault(name, [])
+                metric_dict[name].append(metric.detach())
+
+                step_dict.setdefault(name, [])
+                step_dict[name].append(self.step)
+
+                if what == 'epoch':
+                    epoch_dict = metrics_dict['epochs']
+                    epoch_dict.setdefault(name, [])
+                    epoch_dict[name].append(self.epoch)
 
 
     def _train_epoch(self):
@@ -594,11 +594,18 @@ class Trainer():
             # shuffles data across epochs when using DistributedSampler
             self.train_loader.sampler.set_epoch(self.epoch)
 
+        # ys = None
+
         # training loop
         for batch_idx, (x, y) in enumerate(self.train_loader):
             self.step += 1
 
             x, y = x.to(self.device), y.to(self.device)
+
+            # if ys is None:
+            #     ys = torch.bincount(y, minlength=10).detach()
+            # else:
+            #     ys += torch.bincount(y, minlength=10).detach()
 
             # mean over the batch size
             step_metrics = self._train_step(x, y)
@@ -644,6 +651,8 @@ class Trainer():
                     f'Total steps: {self.step}',
                     end=end
                 )
+
+        # print(f'Rank {self.rank} ys: {ys}')
 
         # calculate epoch training metrics
 
@@ -701,9 +710,6 @@ class Trainer():
             metrics[self.loss_fn.__name__].backward()
 
         self.optimizer.step()
-
-        # for name, metric in metrics.items():
-        #     metrics[name] = metric.item()
 
         return metrics
 
@@ -796,6 +802,10 @@ class Trainer():
         if prints:
             print()
 
+        # TODO: remove
+        # torch.cuda.synchronize()
+        # print(f'Rank {self.rank} validation acc: {metrics["acc"]:.6f}')
+
         if not self.stop_early:
             # save step validation loss and acc
             self._cache_metrics(metrics, what="step", stage="valid")
@@ -813,27 +823,29 @@ class Trainer():
         if self.ddp or not is_multiproc():
             return
 
-        # get the mean of metrics from all ranks
-        for metrics_dict in [self.epoch_valid_metrics, self.epoch_train_metrics,
-                             self.step_valid_metrics, self.step_train_metrics]:
+        with torch.inference_mode():
 
-            metrics_dict['mean_metrics'] = {}
+            # get the mean of metrics from all ranks
+            for metrics_dict in [self.epoch_valid_metrics, self.epoch_train_metrics,
+                                 self.step_valid_metrics, self.step_train_metrics]:
 
-            for name in metrics_dict['metrics'].keys():
+                metrics_dict['mean_metrics'] = {}
 
-                # we'll store mean metrics separately
-                metrics_dict['mean_metrics'][name] = torch.asarray(
-                    metrics_dict['metrics'][name],
-                    device=self.rank
-                )
+                for name in metrics_dict['metrics'].keys():
 
-                dist.reduce(metrics_dict['mean_metrics'][name],
-                            dst=0, # send to rank 0
-                            op=torch.distributed.ReduceOp.AVG,
-                            async_op=False)
+                    # we'll store mean metrics separately
+                    metrics_dict['mean_metrics'][name] = torch.asarray(
+                        metrics_dict['metrics'][name],
+                        device=self.rank
+                    )
 
-            if self.rank != 0:
-                del metrics_dict['mean_metrics']
+                    dist.reduce(metrics_dict['mean_metrics'][name],
+                                dst=0, # send to rank 0
+                                op=torch.distributed.ReduceOp.AVG,
+                                async_op=False)
+
+                if self.rank != 0:
+                    del metrics_dict['mean_metrics']
 
 
     def _log_separate(self, what='epoch'):
@@ -921,13 +933,15 @@ class Trainer():
 
 
     def _log_metrics(self):
-        self._log_separate()
-        self._log_separate('step')
+        with torch.inference_mode():
 
-        self._log_together()
-        self._log_together('step')
+            self._log_separate()
+            self._log_separate('step')
 
-        self._log_hparam_metrics()
+            self._log_together()
+            self._log_together('step')
+
+            self._log_hparam_metrics()
 
 
     def _log_hparam_metrics(self):

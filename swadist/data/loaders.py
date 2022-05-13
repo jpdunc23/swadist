@@ -85,7 +85,10 @@ def get_dataloaders(dataset,
     # create training data sampler
     train_sampler = kwargs.get('sampler', None)
 
-    if split_training:
+    if train_sampler is not None:
+        print(f'Using {train_sampler.__class__.__name__}')
+
+    elif split_training:
         indices = np.array_split(np.arange(len(datasets['train'])), world_size)
         train_sampler = SubsetRandomSampler(indices[rank])
         print(f'Using SubsetRandomSampler with samples '
@@ -93,7 +96,8 @@ def get_dataloaders(dataset,
 
     elif data_parallel:
         train_sampler = DistributedSampler(datasets['train'])
-        print(f'Using DistributedSampler')
+        print('Using DistributedSampler with '
+              f'{train_sampler.num_samples}/{train_sampler.total_size} samples')
 
     elif train_sampler is None:
         train_sampler = RandomSampler(datasets['train'])
@@ -109,8 +113,8 @@ def get_dataloaders(dataset,
             **kwargs
         )
 
-    print(f'Number of training samples: {len(datasets["train"])}')
-    print(f'Number of training batches: {len(loaders["train"])}\n')
+    print(f'Total training samples: {len(datasets["train"])}')
+    print(f'Total training batches: {len(loaders["train"])}\n')
 
     # convert loaders to sorted list
     loaders = [loaders[k] for k in ['train', 'validation', 'test'] if k in loaders.keys()]
