@@ -131,13 +131,23 @@ if __name__ == "__main__":
 
         for method, kwargs in method_kwargs.items():
 
+            if bs < 4096:
+                continue
+
+            if method == 'swadist-replicas':
+                what = 'swadist'
+            else:
+                what = method
+
+            if bs == 8142:
+                kwargs['train_kwargs'][f'epochs_{what}'] = 400
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            if method in ['codist', 'swadist', 'swadist-replicas']:
+            if what in ['codist', 'swadist']:
                 # get ~3 syncs per epoch
                 sync_freq = int(np.ceil(45000 / (3*bs)))
-                what = 'codist' if method == 'codist' else 'swadist'
                 kwargs['train_kwargs'][f'{what}_kwargs']['sync_freq'] = sync_freq
 
             trainer_kwargs = deepcopy(kwargs['trainer_kwargs'])
