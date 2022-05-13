@@ -133,14 +133,13 @@ if __name__ == "__main__":
 
             if bs < 4096:
                 continue
+            else:
+                kwargs['train_kwargs'][f'epochs_{what}'] = 400
 
             if method == 'swadist-replicas':
                 what = 'swadist'
             else:
                 what = method
-
-            if bs == 8142:
-                kwargs['train_kwargs'][f'epochs_{what}'] = 400
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
