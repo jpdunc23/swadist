@@ -42,8 +42,9 @@ if __name__ == "__main__":
         'dataloader_kwargs': {
             'dataset': 'cifar10',
             'root_dir': datadir,
-            'num_workers': 4,
+            'num_workers': 1,
             'data_parallel': True,
+            # 'pin_memory': True, # set in spawn_fn
         },
         'model_kwargs': {
             'n_classes': 10,
@@ -61,38 +62,30 @@ if __name__ == "__main__":
             'n_print': 0,
         },
         'train_kwargs': {
-            'codist_kwargs': {
-                'sync_freq': 50,
-                'transform': 'softmax',
-            },
             'swadist_kwargs': {
                 'sync_freq': 50,
                 'transform': 'softmax',
-                'max_averaged': 5,
+                'max_averaged': 3,
             },
-            'stopping_acc': 0.75,
+            'stopping_acc': 0.7,
             'save': True,
         },
         'scheduler_kwargs': {
             'alpha': 0.25,
             'decay_epochs': 50,
         },
-        'swa_scheduler_kwargs': {
-            'anneal_strategy': 'cos',
-            'anneal_epochs': 5,
-        },
     }
 
     # batch_size
-    # batch_size = [2**i for i in range(1, 14)]
-    batch_size = [2**i for i in range(6, 14)]
+    batch_size = [2**i for i in range(1, 14)]
+    # batch_size = [2**i for i in range(6, 14)]
 
     # initial lr and momentum
-    # lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
-    lr0 = 2**np.array([-5., -5., -5., -6., -5., -7., -4., -6.])
+    lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
+    # lr0 = 2**np.array([-5., -5., -5., -6., -5., -7., -4., -6.])
 
-    # momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
-    momentum = [.95, .97, .975, .98, .975, .98, .97, .975]
+    momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
+    # momentum = [.95, .97, .975, .98, .975, .98, .97, .975]
 
     assert len(lr0) == len(batch_size), 'lr0 has the wrong size'
     assert len(momentum) == len(batch_size), 'momentum has the wrong size'
@@ -100,31 +93,40 @@ if __name__ == "__main__":
     seed = int((datetime.date.today() - datetime.date(2022, 4, 11)).total_seconds())
     print(f'seed: {seed}')
 
-    methods = ['swadist', 'sgd', 'swa', 'codist', 'codistswa']
+    methods = ['swadist', 'swadist-replicas', 'codist', 'sgd']
     method_kwargs = { method: deepcopy(common_kwargs) for method in methods }
 
-    # method_kwargs['swadist']['dataloader_kwargs'].update({ 'split_training': True })
+    # swadist w/o SWA replicas
     method_kwargs['swadist']['trainer_kwargs'].update({ 'name': 'swadist' })
     method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 0,
                                                       'epochs_codist': 0,
                                                       'epochs_swa': 200,
                                                       'swadist': True })
 
-    # method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
-    method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
-    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 200, 'codist_kwargs': None })
+    # swadist with SWA replicas
+    method_kwargs['swadist-replicas']['trainer_kwargs'].update({ 'name': 'swadist-replicas' })
+    method_kwargs['swadist-replicas']['train_kwargs'].update({ 'epochs_sgd': 0,
+                                                               'epochs_codist': 0,
+                                                               'epochs_swa': 200,
+                                                               'swadist': True })
+    method_kwargs['swadist-replicas']['train_kwargs']['swadist_kwargs'].update(
+        { 'swa_replicas': True }
+    )
 
-    # method_kwargs['codist']['dataloader_kwargs'].update({ 'split_training': True })
+    # codist
     method_kwargs['codist']['trainer_kwargs'].update({ 'name': 'codist' })
-    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 190 })
+    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 0,
+                                                     'epochs_codist': 200,
+                                                     'epochs_swa': 0 })
+    method_kwargs['codist']['train_kwargs']['swadist_kwargs'] = None
+    method_kwargs['codist']['train_kwargs']['codist_kwargs'] = {
+        'sync_freq': 50,
+        'transform': 'softmax',
+    }
 
-    # method_kwargs['swa']['dataloader_kwargs'].update({ 'data_parallel': True })
-    method_kwargs['swa']['trainer_kwargs'].update({ 'name': 'swa' })
-    method_kwargs['swa']['train_kwargs'].update({ 'epochs_sgd': 40, 'epochs_swa': 160, 'codist_kwargs': None })
-
-    # method_kwargs['codistswa']['dataloader_kwargs'].update({ 'split_training': True })
-    method_kwargs['codistswa']['trainer_kwargs'].update({ 'name': 'codistswa' })
-    method_kwargs['codistswa']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 180, 'epochs_swa': 10 })
+    # SGD
+    method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
+    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 200, 'swadist_kwargs': None })
 
     for bs, lr, mo in zip(batch_size, lr0, momentum):
 
@@ -138,12 +140,6 @@ if __name__ == "__main__":
 
             kwargs['dataloader_kwargs']['batch_size'] = bs // world_size
             kwargs['optimizer_kwargs'].update({ 'lr': lr, 'momentum': mo })
-            kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
-
-            if method not in ['swa', 'codistswa']:
-                swa_scheduler_kwargs = None
-            else:
-                swa_scheduler_kwargs = kwargs['swa_scheduler_kwargs']
 
             args = (world_size,
                     kwargs['dataloader_kwargs'],
@@ -152,7 +148,7 @@ if __name__ == "__main__":
                     trainer_kwargs,
                     kwargs['train_kwargs'],
                     kwargs['scheduler_kwargs'],
-                    swa_scheduler_kwargs,
+                    None, # swa_scheduler_kwargs,
                     seed)
 
             torch.multiprocessing.spawn(spawn_fn, args=args, nprocs=world_size, join=True)
