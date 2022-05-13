@@ -10,8 +10,10 @@ import warnings
 from copy import deepcopy
 from datetime import datetime
 
-import torch
 import numpy as np
+
+import torch
+import torch.distributed as dist
 
 from torch.nn.utils import parameters_to_vector
 from torchvision.utils import make_grid
@@ -111,6 +113,7 @@ class Trainer():
         self.prints = prints
 
         self.name = name
+
         self.logs = log
         self.log_dir = log_dir
 
@@ -314,10 +317,6 @@ class Trainer():
         elapsed = (time.perf_counter() - tic) / 60
         hparams['training_minutes'] = elapsed
 
-        if self.prints:
-            print(f'Training complete in {elapsed:.2f}min')
-
-
         if not self.stop_early:
             # cache the trained network
             self.final_model = self.model
@@ -339,13 +338,21 @@ class Trainer():
 
         torch.cuda.synchronize()
 
+        # get mean metrics on rank 0
+        self.reduce_metrics()
+
+        if self.prints:
+            acc = self.step_valid_metrics.get(
+                'mean_metrics', self.step_valid_metrics['metrics']
+            )['acc'][-1]
+            steps = self.step_valid_metrics['steps']['acc'][-1]
+
+            print(f'Training complete in {elapsed:.2f}min')
+            print(f'Final validation accuracy after {steps} steps '
+                  f'(mean across ranks): {acc:.6f}\n')
+
         if self.logs:
             self._log_metrics()
-
-        # all ranks because we all_reduce the metrics
-        self._log_hparam_metrics()
-
-        if self.logs:
             self.writer.close()
 
         if save:
@@ -373,9 +380,10 @@ class Trainer():
 
         if check_for_stall:
 
+            accs = self.epoch_valid_metrics['metrics']['acc']
             n_avg = self.stop_stall_n_epochs
-            acc_mean = torch.asarray(self.epoch_valid_metrics['acc'][-n_avg:]).mean()
-            old_mean = torch.asarray(self.epoch_valid_metrics['acc'][-(2*n_avg):-n_avg]).mean()
+            acc_mean = torch.asarray(accs[-n_avg:]).mean()
+            old_mean = torch.asarray(accs[-(2*n_avg):-n_avg]).mean()
             acc = acc_mean - old_mean
 
             if not self.ddp and is_multiproc():
@@ -489,15 +497,15 @@ class Trainer():
 
         if self.swadist:
             self.in_swadist = True
-            phase_name = 'SWADist'
+            phase = 'SWADist'
         else:
             self.in_swa = True
-            phase_name = 'SWA'
+            phase = 'SWA'
 
         self.epochs_swa = 0
 
         if self.prints:
-            print(f'Starting {phase_name} phase...\n')
+            print(f'Starting {phase} phase...\n')
 
         # self.model.to('cpu')
 
@@ -729,7 +737,6 @@ class Trainer():
 
             # only update the bn statistics if not already averaging buffers
             if not self.swa_model.use_buffers:
-                # self.swa_model.to(self.device)
                 torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
 
         if self.in_swadist:
@@ -800,6 +807,33 @@ class Trainer():
             # check if we should stop early
             self._stop_early()
             self._check_for_stall()
+
+
+    def reduce_metrics(self):
+        if self.ddp or not is_multiproc():
+            return
+
+        # get the mean of metrics from all ranks
+        for metrics_dict in [self.epoch_valid_metrics, self.epoch_train_metrics,
+                             self.step_valid_metrics, self.step_train_metrics]:
+
+            metrics_dict['mean_metrics'] = {}
+
+            for name in metrics_dict['metrics'].keys():
+
+                # we'll store mean metrics separately
+                metrics_dict['mean_metrics'][name] = torch.asarray(
+                    metrics_dict['metrics'][name],
+                    device=self.rank
+                )
+
+                dist.reduce(metrics_dict['mean_metrics'][name],
+                            dst=0, # send to rank 0
+                            op=torch.distributed.ReduceOp.AVG,
+                            async_op=False)
+
+            if self.rank != 0:
+                del metrics_dict['mean_metrics']
 
 
     def _log_separate(self, what='epoch'):
@@ -894,27 +928,21 @@ class Trainer():
         self._log_together()
         self._log_together('step')
 
+        self._log_hparam_metrics()
+
 
     def _log_hparam_metrics(self):
         log_dict = {}
 
         for what in ['step', 'epoch']:
-            metrics_dict = getattr(self, f'{what}_valid_metrics')['metrics']
-            whats_dict = getattr(self, f'{what}_valid_metrics')[f'{what}s']
+            what_metrics_dict = getattr(self, f'{what}_valid_metrics')
+            metrics_dict = what_metrics_dict.get('mean_metrics', what_metrics_dict['metrics'])
+            whats_dict = what_metrics_dict[f'{what}s']
 
             for name, metrics in metrics_dict.items():
 
                 whats = whats_dict[name]
-                metrics = torch.asarray(metrics, device=self.rank)
-
-                # get best metrics after averaging over ranks
-
-                if not self.ddp and is_multiproc():
-
-                    # get all ranks' metrics and take the mean
-                    _, metrics = all_reduce(metrics,
-                                            op=torch.distributed.ReduceOp.AVG,
-                                            async_op=False)
+                metrics = torch.asarray(metrics)
 
                 if name == 'acc':
                     best_idx = torch.argmax(metrics)
@@ -926,8 +954,7 @@ class Trainer():
                     f'hparams {what}/best validation {name}': metrics[best_idx],
                 })
 
-        if self.logs:
-            self.writer.add_hparams(self.hparams, log_dict)
+        self.writer.add_hparams(self.hparams, log_dict)
 
 
     def save(self,
