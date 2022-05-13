@@ -843,8 +843,8 @@ class Trainer():
         train_dict = getattr(self, f'{what}_train_metrics')
         valid_dict = getattr(self, f'{what}_valid_metrics')
 
-        train_metrics_dict = train_dict['metrics']
-        valid_metrics_dict = valid_dict['metrics']
+        train_metrics_dict = train_dict.get('mean_metrics', train_dict['metrics'])
+        valid_metrics_dict = valid_dict.get('mean_metrics', valid_dict['metrics'])
 
         train_iters_dict = train_dict[f'{what}s']
         valid_iters_dict = valid_dict[f'{what}s']
@@ -875,16 +875,15 @@ class Trainer():
         train_dict = getattr(self, f'{what}_train_metrics')
         valid_dict = getattr(self, f'{what}_valid_metrics')
 
-        train_metrics_dict = train_dict['metrics']
-        valid_metrics_dict = valid_dict['metrics']
+        train_metrics_dict = train_dict.get('mean_metrics', train_dict['metrics'])
+        valid_metrics_dict = valid_dict.get('mean_metrics', valid_dict['metrics'])
 
         valid_iters_dict = valid_dict[f'{what}s']
 
         # codist_loss and swadist_loss don't have validation metrics
         for name in valid_metrics_dict.keys():
 
-            if name not in train_metrics_dict.keys(): #or
-                # name in ['step', 'epoch']):
+            if name not in train_metrics_dict.keys():
                 continue
 
             if what == 'step':
