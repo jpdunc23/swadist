@@ -3,13 +3,16 @@ Adapted from https://github.com/Yu-Group/adaptive-wavelets/blob/master/awave/uti
 """
 
 import os
-import warnings
+import time
+import pathlib
 
 from copy import deepcopy
 from datetime import datetime
 
-import torch
 import numpy as np
+
+import torch
+import torch.distributed as dist
 
 from torch.nn.utils import parameters_to_vector
 from torchvision.utils import make_grid
@@ -18,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .optim import LinearPolyLR
 from .metrics import accuracy, CodistillationLoss, SWADistLoss
-from .distributed import all_gather, all_reduce, is_multiproc
+from .distributed import all_reduce, is_multiproc
 
 
 __all__ = ['Trainer']
@@ -81,11 +84,13 @@ class Trainer():
                  log=False,
                  log_dir='./runs',
                  save_dir='./state_dicts',
-                 n_print=10):
+                 prints=True,
+                 n_print=0):
 
         self.device = device
         self.model = model.to(self.device)
         self.swa_model = None
+        self.swadist_model = None
         self.final_model = None
         self.ddp = model.__class__.__name__ == 'DistributedDataParallel'
 
@@ -104,10 +109,11 @@ class Trainer():
         self.world_size = world_size
 
         self.n_print = n_print
-        self.prints = self.n_print > 0 and self.rank == 0
+        self.prints = prints
 
         self.name = name
-        self.logs = log and self.rank == 0
+
+        self.logs = log
         self.log_dir = log_dir
 
         self.save_dir = save_dir
@@ -126,7 +132,6 @@ class Trainer():
         self.in_swadist = None
         self.in_swa = None
 
-        self.val_freq = None
         self.stop_stall_n_epochs = None
         self.stopping_acc = None
         self.stop_early = None
@@ -159,13 +164,11 @@ class Trainer():
               swadist: bool=False,
               codist_kwargs: dict=None,
               swadist_kwargs: dict=None,
-              validations_per_epoch: int=None,
               stopping_acc: float=None,
-              stop_stall_n_epochs: int=5,
+              stop_stall_n_epochs: int=None,
               save: bool=False,
               save_dir: str=None):
-        """
-        Trains the model.
+        """Trains the model.
 
         Parameters
         ----------
@@ -179,11 +182,11 @@ class Trainer():
             If True, use codistillation during the SWA phase.
         codist_kwargs: dict, optional
             Additional keyword arguments to pass to `CodistillationLoss` initializer.
-        validations_per_epoch: int, optional
-            Number of model evaluations on the validation data per epoch. There is always at least
-            one validation at the end of each epoch.
         stopping_acc: float, optional
             Validation accuracy at which to stop training.
+        stop_stall_n_epochs: int, optional
+            If the mean over the last `stop_stall_n_epochs` is less than the mean
+            over the previous `stop_stall_n_epochs`, then training is stopped.
         save: bool
             If True, save the final model, optimizer, and scheduler states and hyperparameters.
         save_dir: str
@@ -194,6 +197,7 @@ class Trainer():
 
         # save hyperparameters
         hparams = {
+            'name': self.name,
             'world_size': self.world_size,
             'global_batch_size': self.train_loader.batch_size * self.world_size,
             'optimizer': type(self.optimizer).__name__,
@@ -212,13 +216,6 @@ class Trainer():
 
         self.epochs_codist = epochs_codist
         self.epochs_swa = epochs_swa
-
-        if validations_per_epoch:
-            n_valid = min(self.n_batches, validations_per_epoch)
-            if n_valid < validations_per_epoch:
-                warnings.warn(f'Requested {validations_per_epoch} validations per epoch but only '
-                              f'have {n_valid} batches. Using validations_per_epoch={n_valid}.')
-            self.val_freq = self.n_batches // n_valid
 
         self.stop_stall_n_epochs = stop_stall_n_epochs
         self.stopping_acc = stopping_acc
@@ -259,7 +256,8 @@ class Trainer():
                   f'Codistillation epochs: {epochs_codist} | '
                   f'{swa_str} epochs: {epochs_swa}')
             print(f'DistributedDataParallel: {self.ddp}')
-            print(f'Stopping accuracy: {self.stopping_acc}\n')
+            print(f'Stopping accuracy: {self.stopping_acc}')
+            print(f'Global batch size: {hparams["global_batch_size"]}\n')
 
         # begin training
 
@@ -267,6 +265,8 @@ class Trainer():
         self.epoch_valid_metrics = {}
         self.step_train_metrics = {}
         self.step_valid_metrics = {}
+
+        tic = time.perf_counter()
 
         # vanilla SGD / burn-in
 
@@ -313,6 +313,9 @@ class Trainer():
         else:
             self.swa_scheduler = None
 
+        elapsed = (time.perf_counter() - tic) / 60
+        hparams['training_minutes'] = elapsed
+
         if not self.stop_early:
             # cache the trained network
             self.final_model = self.model
@@ -331,73 +334,102 @@ class Trainer():
             hparams['swadist_max_averaged'] = swadist_kwargs.get('max_averaged', None)
 
         self.hparams = hparams
-        self._log_hparam_metrics()
+
+        torch.cuda.synchronize()
+
+        # get mean metrics on rank 0
+        self.reduce_metrics()
+
+        if self.prints:
+            acc = self.step_valid_metrics.get(
+                'mean_metrics', self.step_valid_metrics['metrics']
+            )['acc'][-1]
+            steps = self.step_valid_metrics['steps']['acc'][-1]
+
+            print(f'Training complete in {elapsed:.2f}min')
+            print(f'Final validation accuracy after {steps} steps '
+                  f'(mean across ranks): {acc:.6f}\n')
 
         if self.logs:
+            self._log_metrics()
             self.writer.close()
 
         if save:
             self.save(save_dir=save_dir)
 
 
-    def _stop_early(self):
+    def _check_for_stall(self):
 
-        stopping_acc = self.stopping_acc
+        if self.stop_early or self.epoch % self.stop_stall_n_epochs != 0:
+            return
 
-        # stop early training has stalled out (avg acc of most recent
-        # `stop_stall_n_epochs` epochs is less than that of n_avg+1 epochs ago)
+        # stop current phase early if training has stalled out (avg acc of most
+        # recent `stop_stall_n_epochs` epochs is less than that of n_avg+1
+        # epochs ago)
         check_for_stall = (
             self.stop_stall_n_epochs is not None and
+            self.stop_stall_n_epochs > 0 and
             ((self.in_sgd and
-              self.epochs_codist + self.epochs_swa > 0 and
-              self.epochs_sgd >= 10) or
+              self.epochs_sgd >= 2*self.stop_stall_n_epochs) or
              (self.in_codist and
-              self.epochs_swa > 0 and
-              self.epochs_codist >= 10))
+              self.epochs_codist >= 2*self.stop_stall_n_epochs) or
+             ((self.in_swa or self.in_swadist) and
+              self.epochs_swa >= 2*self.stop_stall_n_epochs))
         )
 
         if check_for_stall:
-            n_avg = self.stop_stall_n_epochs
-            acc_mean = np.mean(self.epoch_valid_metrics['acc'][-n_avg:])
-            acc = self.epoch_valid_metrics['acc'][-(n_avg+1)] - acc_mean
-            stopping_acc = 0.
 
-        elif self.stopping_acc is None or self.stop_early:
+            accs = self.epoch_valid_metrics['metrics']['acc']
+            n_avg = self.stop_stall_n_epochs
+            acc_mean = torch.asarray(accs[-n_avg:]).mean()
+            old_mean = torch.asarray(accs[-(2*n_avg):-n_avg]).mean()
+            acc = acc_mean - old_mean
+
+            if not self.ddp and is_multiproc():
+
+                # get avg mean acc difference across ranks
+                _, acc = all_reduce(acc.to(self.rank),
+                                    op=torch.distributed.ReduceOp.AVG,
+                                    async_op=False)
+
+            if acc < 0:
+
+                self.stop_early = True
+
+                if self.prints:
+
+                    print(f'\n\nThis phase of training stalled (mean accuracy of last {n_avg} '
+                          f'epochs was {acc:.6f} less then mean of the {n_avg} before, '
+                          'on average across all ranks). Moving onto the next phase.')
+
+
+    def _stop_early(self):
+
+        if self.stopping_acc is None or self.stop_early:
             # already stopped early
             return
 
-        else:
-            acc = self.step_valid_metrics['acc'][-1]
+        acc = self.epoch_valid_metrics['metrics']['acc'][-1]
 
         if not self.ddp and is_multiproc():
+
             # get average validation acc across ranks
-            _, acc = all_reduce(torch.tensor(acc, device=self.device),
+            _, acc = all_reduce(acc,
                                 op=torch.distributed.ReduceOp.AVG,
                                 async_op=False)
-            acc = acc.cpu().item()
 
-        if acc >= stopping_acc:
+        if acc >= self.stopping_acc:
 
             self.stop_early = True
 
-            if check_for_stall:
-                msg = (f'\n\n{"sgd" if self.in_sgd else "codist"} stalled (mean accuracy '
-                       f'of last {n_avg} epochs was {acc:.6f} less than the one before, '
-                       'on average across all ranks). '
-                       f'Moving onto the next phase of training.')
-            else:
-                msg = ('\n\nValidation accuracy target reached '
-                       f'(mean accuracy across ranks after {self.step} steps: {acc:.6f}). '
-                       'Saving current model and stopping.')
-
             if self.prints:
+                print('\n\nValidation accuracy target reached '
+                      f'(mean accuracy across ranks at epoch {self.epoch}: {acc.item():.6f}). '
+                      'Saving current model and stopping.')
 
-                print(msg)
-
-            if not check_for_stall:
-                self.model.cpu()
-                self.final_model = deepcopy(self.model)
-                self.model.to(self.device)
+            self.model.cpu()
+            self.final_model = deepcopy(self.model)
+            self.model.to(self.device)
 
 
     def _sgd(self, epochs):
@@ -425,10 +457,13 @@ class Trainer():
         self.in_codist = True
         self.epochs_codist = 0
 
-        if epochs > 0 and self.prints:
-            print(f'Starting codistillation phase...\n')
-
         loss_fn = codist_kwargs.get('loss_fn', self.loss_fn)
+
+        if self.prints:
+            print(f'Starting codistillation phase...')
+            print(f'loss_fn: {loss_fn.__name__}')
+            print(f'sync_freq: {codist_kwargs.get("sync_freq", 50)}')
+            print(f'transform: {codist_kwargs.get("transform", "softmax")}\n')
 
         # init codistillation loss
         self.codist_loss_fn = CodistillationLoss(loss_fn,
@@ -457,17 +492,19 @@ class Trainer():
 
     def _swa(self, epochs, swadist_kwargs):
 
+        # TODO: separate swadist into it's own method
+
         if self.swadist:
             self.in_swadist = True
-            phase_name = 'SWADist'
+            phase = 'SWADist'
         else:
             self.in_swa = True
-            phase_name = 'SWA'
+            phase = 'SWA'
 
         self.epochs_swa = 0
 
         if self.prints:
-            print(f'Starting {phase_name} phase...\n')
+            print(f'Starting {phase} phase...\n')
 
         # self.model.to('cpu')
 
@@ -476,14 +513,21 @@ class Trainer():
 
             loss_fn = swadist_kwargs.get('loss_fn', self.loss_fn)
 
-            # initialize self.codist_loss_fn
+            if self.prints:
+                print(f'loss_fn: {loss_fn.__name__}')
+                print(f'sync_freq: {swadist_kwargs.get("sync_freq", 50)}')
+                print(f'max_averaged: {swadist_kwargs.get("max_averaged", None)}')
+                print(f'swa_replicas: {swadist_kwargs.get("swa_replicas", False)}')
+                print(f'swa_inference: {swadist_kwargs.get("swa_inference", True)}')
+                print(f'transform: {swadist_kwargs.get("transform", "softmax")}\n')
+
             self.swadist_loss_fn = SWADistLoss(loss_fn,
                                                self.model,
                                                self.rank,
                                                self.world_size,
                                                **swadist_kwargs)
 
-            self.swa_model = self.swadist_loss_fn.swa_model
+            self.swadist_model = self.swadist_loss_fn.swadist_model
 
         else:
             self.swa_model = torch.optim.swa_utils.AveragedModel(self.model)
@@ -509,17 +553,31 @@ class Trainer():
         self.in_swa = False
 
 
-    def _save_metrics(self, metrics, what='step', stage='train'):
-        metric_dict = getattr(self, f'{what}_{stage}_metrics')
+    def _cache_metrics(self, metrics, what='step', stage='train'):
+        with torch.inference_mode():
+            metrics_dict = getattr(self, f'{what}_{stage}_metrics')
 
-        # save the step metrics
-        for name, metric in metrics.items():
-            metric_dict.setdefault(name, [])
-            metric_dict[name].append(metric)
+            metrics_dict.setdefault('metrics', {})
+            metrics_dict.setdefault('steps', {})
+            if what == 'epoch':
+                metrics_dict.setdefault('epochs', {})
 
-        if what == 'step':
-            metric_dict.setdefault('step', [])
-            metric_dict['step'].append(self.step)
+            # save the step metrics
+            for name, metric in metrics.items():
+
+                metric_dict = metrics_dict['metrics']
+                step_dict = metrics_dict['steps']
+
+                metric_dict.setdefault(name, [])
+                metric_dict[name].append(metric.detach())
+
+                step_dict.setdefault(name, [])
+                step_dict[name].append(self.step)
+
+                if what == 'epoch':
+                    epoch_dict = metrics_dict['epochs']
+                    epoch_dict.setdefault(name, [])
+                    epoch_dict[name].append(self.epoch)
 
 
     def _train_epoch(self):
@@ -536,17 +594,24 @@ class Trainer():
             # shuffles data across epochs when using DistributedSampler
             self.train_loader.sampler.set_epoch(self.epoch)
 
+        # ys = None
+
         # training loop
         for batch_idx, (x, y) in enumerate(self.train_loader):
             self.step += 1
 
             x, y = x.to(self.device), y.to(self.device)
 
+            # if ys is None:
+            #     ys = torch.bincount(y, minlength=10).detach()
+            # else:
+            #     ys += torch.bincount(y, minlength=10).detach()
+
             # mean over the batch size
             step_metrics = self._train_step(x, y)
 
             # save metrics
-            self._save_metrics(step_metrics)
+            self._cache_metrics(step_metrics)
 
             for name, metric in step_metrics.items():
                 # running sum of batch mean metrics
@@ -559,7 +624,12 @@ class Trainer():
                     # mean of batch means
                     metrics[name] = metrics[name] / self.n_batches
 
-            if self.prints and (batch_idx % self.n_print == 0 or train_end):
+            if self.n_print > 0:
+                print_ = (batch_idx % self.n_print) == 0
+            else:
+                print_ = False
+
+            if self.prints and (print_ or train_end):
 
                 metrics_ = metrics if train_end else step_metrics
                 metrics_str = 'Metrics (epoch mean): ' if train_end else 'Metrics (batch mean): '
@@ -576,32 +646,23 @@ class Trainer():
                 end = '\n' if train_end else ''
                 print(
                     f'\rTrain epoch: {self.epoch} | {metrics_str} | '
-                    f'Batch (size {x.shape[0]}): {batch_idx + 1}/{self.n_batches} '
+                    f'Batch: {batch_idx + 1}/{self.n_batches} '
                     f'({100. * (batch_idx + 1) / self.n_batches:.0f}%) | '
                     f'Total steps: {self.step}',
                     end=end
                 )
 
-            # if there are any validation steps within the epoch, validate steps
-            if (self.val_freq and
-                not train_end and
-                # time to step validate
-                (batch_idx + 1) % self.val_freq == 0 and
-                # save one of the step validations for the epoch end
-                self.val_freq <= self.n_batches - (batch_idx + 1)):
-
-                # validate and log metrics every val_freq steps
-                self._validate(what='step')
+        # print(f'Rank {self.rank} ys: {ys}')
 
         # calculate epoch training metrics
 
         # save epoch metrics
-        self._save_metrics(metrics, what='epoch')
+        self._cache_metrics(metrics, what='epoch')
 
-        # validate the epoch, which logs metrics
+        # validate the epoch
         self._validate()
 
-        if self.in_swa and self.swa_scheduler is not None:
+        if (self.in_swa or self.in_swadist)  and self.swa_scheduler is not None:
             # update running average of parameters
             self.swa_scheduler.step()
         elif self.scheduler is not None:
@@ -650,9 +711,6 @@ class Trainer():
 
         self.optimizer.step()
 
-        for name, metric in metrics.items():
-            metrics[name] = metric.item()
-
         return metrics
 
 
@@ -673,33 +731,24 @@ class Trainer():
         prints = epoch_val and self.prints
         n_batches = len(self.valid_loader)
 
-        # TODO: how often AveragedModel is updated should be up to user
-        if self.in_swa and epoch_val:
+        if self.in_swadist and epoch_val:
+            # updates self.swadist_model
+            self.swadist_loss_fn.update_swa_parameters()
 
-            # self.model.to('cpu')
+        elif self.in_swa and epoch_val:
+            assert not self.in_swadist
 
             # update the AveragedModel and batchnorm stats before every eval
+            self.swa_model.update_parameters(self.model)
 
-            if self.swadist:
-                # updates self.swa_model
-                self.swadist_loss_fn.update_swa_parameters()
+            # only update the bn statistics if not already averaging buffers
+            if not self.swa_model.use_buffers:
+                torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
 
-            else:
-                # update the AveragedModel and batchnorm stats before every eval
-                self.swa_model.update_parameters(self.model)
-
-            # self.swa_model.to(self.device)
-
-            torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
-
+        if self.in_swadist:
+            self.swadist_model.eval()
         if self.in_swa:
-            # move model to the cpu
-            # self.model.to('cpu')
-
-            # move swa_model to the gpu and eval
-            # self.swa_model.to(self.device)
             self.swa_model.eval()
-
         else:
             self.model.eval()
 
@@ -708,16 +757,18 @@ class Trainer():
             for batch_idx, (x, y) in enumerate(self.valid_loader):
                 x, y = x.to(self.device), y.to(self.device)
 
-                if self.in_swa:
+                if self.in_swadist:
+                    output = self.swadist_model(x)
+                elif self.in_swa:
                     output = self.swa_model(x)
                 else:
                     output = self.model(x)
 
                 # add batch step loss to the validation metrics
                 metrics.setdefault(self.loss_fn.__name__, 0.)
-                metrics[self.loss_fn.__name__] += self.loss_fn(output, y).item()
+                metrics[self.loss_fn.__name__] += self.loss_fn(output, y)
                 metrics.setdefault('acc', 0.)
-                metrics['acc'] += accuracy(output, y).item()
+                metrics['acc'] += accuracy(output, y)
 
                 # final validation batch?
                 val_end = batch_idx == (n_batches - 1)
@@ -726,7 +777,12 @@ class Trainer():
                     metrics[self.loss_fn.__name__] = metrics[self.loss_fn.__name__] / n_batches
                     metrics['acc'] = metrics['acc'] / n_batches
 
-                if self.n_print > 0 and (val_end or (batch_idx % self.n_print) == 0):
+                if self.n_print > 0:
+                    print_ = (batch_idx % self.n_print) == 0
+                else:
+                    print_ = False
+
+                if prints and (val_end or print_):
 
                     metric_strs = [('\rValidation (batch mean) | ',
                                     metrics[self.loss_fn.__name__],
@@ -734,142 +790,184 @@ class Trainer():
 
                     end = '\n' if val_end else ''
 
-                    if val_end and not self.ddp and is_multiproc():
-
-                        if prints:
-                            print('\r', end='')
-
-                        metric_arr = torch.asarray(metric_strs[0][1:], device=self.device)
-
-                        # gather all ranks' metrics at end of validation
-                        _, metric_arr = all_gather(metric_arr,
-                                                   world_size=self.world_size)
-
-                        metric_strs = []
-                        for i, arr in enumerate(metric_arr):
-                            metric_strs.append((f'Rank {i} | Validation mean | ',
-                                                arr[0].item(), # rank i loss
-                                                arr[1].item())) # rank i acc
-
-                    if prints:
-                        # only print on rank 0
-                        for (begin, batch_loss, batch_acc) in metric_strs:
-                            print(begin,
-                                  f'{self.loss_fn.__name__}={batch_loss:.6f} <> '
-                                  f'accuracy={batch_acc:.6f} | '
-                                  f'Batch: {batch_idx + 1}/{n_batches} '
-                                  f'({100.*(batch_idx + 1) / n_batches:.0f}%)',
-                                  end=end)
-
-        # if self.in_swa:
-        #     # move swa_model back to the cpu and model back to the gpu
-        #     self.swa_model.to('cpu')
-        #     self.model.to(self.rank)
+                    # only print on min rank
+                    for (begin, batch_loss, batch_acc) in metric_strs:
+                        print(begin,
+                              f'{self.loss_fn.__name__}={batch_loss:.6f} <> '
+                              f'accuracy={batch_acc:.6f} | '
+                              f'Batch: {batch_idx + 1}/{n_batches} '
+                              f'({100.*(batch_idx + 1) / n_batches:.0f}%)',
+                              end=end)
 
         if prints:
             print()
 
+        # TODO: remove
+        # torch.cuda.synchronize()
+        # print(f'Rank {self.rank} validation acc: {metrics["acc"]:.6f}')
+
         if not self.stop_early:
             # save step validation loss and acc
-            self._save_metrics(metrics, what="step", stage="valid")
-            # log training and validation metrics for epoch
-            self._log_together(what='step')
-            self._log_separate(what='step')
+            self._cache_metrics(metrics, what="step", stage="valid")
 
         if epoch_val:
             # save and log epoch loss and acc
-            self._save_metrics(metrics, what="epoch", stage="valid")
-            # log training and validation metrics for epoch
-            self._log_together(what='epoch')
-            self._log_separate(what='epoch')
+            self._cache_metrics(metrics, what="epoch", stage="valid")
 
             # check if we should stop early
             self._stop_early()
+            self._check_for_stall()
+
+
+    def reduce_metrics(self):
+        if self.ddp or not is_multiproc():
+            return
+
+        with torch.inference_mode():
+
+            # get the mean of metrics from all ranks
+            for metrics_dict in [self.epoch_valid_metrics, self.epoch_train_metrics,
+                                 self.step_valid_metrics, self.step_train_metrics]:
+
+                metrics_dict['mean_metrics'] = {}
+
+                for name in metrics_dict['metrics'].keys():
+
+                    # we'll store mean metrics separately
+                    metrics_dict['mean_metrics'][name] = torch.asarray(
+                        metrics_dict['metrics'][name],
+                        device=self.rank
+                    )
+
+                    dist.reduce(metrics_dict['mean_metrics'][name],
+                                dst=0, # send to rank 0
+                                op=torch.distributed.ReduceOp.AVG,
+                                async_op=False)
+
+                if self.rank != 0:
+                    del metrics_dict['mean_metrics']
 
 
     def _log_separate(self, what='epoch'):
         """Separately log training and validation metrics.
         """
-        if self.logs:
-            if what == 'epoch':
-                train_metrics = self.epoch_train_metrics
-                valid_metrics = self.epoch_valid_metrics
-                step = self.epoch
-            else:
-                train_metrics = self.step_train_metrics
-                valid_metrics = self.step_valid_metrics
-                step = self.step
 
-            for name, metrics in valid_metrics.items():
-                if name != 'acc':
-                    name = f'loss/{name}'
-                self.writer.add_scalar(f'{what} {name}/valid', metrics[-1], step)
+        train_dict = getattr(self, f'{what}_train_metrics')
+        valid_dict = getattr(self, f'{what}_valid_metrics')
 
-            for name, metrics in train_metrics.items():
+        train_metrics_dict = train_dict.get('mean_metrics', train_dict['metrics'])
+        valid_metrics_dict = valid_dict.get('mean_metrics', valid_dict['metrics'])
+
+        train_iters_dict = train_dict[f'{what}s']
+        valid_iters_dict = valid_dict[f'{what}s']
+
+        for stage, iters_dict, metrics_dict in [('valid', valid_iters_dict, valid_metrics_dict),
+                                                ('train', train_iters_dict, train_metrics_dict)]:
+
+            for name, metrics in metrics_dict.items():
+
+                iters = iters_dict[name]
+
+                assert len(metrics) == len(iters), \
+                    (f'{stage} {name} {what}s has different length than corresponding metrics:'
+                     f'\n{what}s len: {len(iters)}'
+                     f'\nmetrics len: {len(metrics)}')
+
+                _name = name
                 if name != 'acc':
-                    name = f'loss/{name}'
-                self.writer.add_scalar(f'{what} {name}/train', metrics[-1], step)
+                    _name = f'loss/{name}'
+
+                for i, metric in enumerate(metrics):
+                    self.writer.add_scalar(f'{what} {_name}/{stage}', metric, iters[i])
 
 
     def _log_together(self, what='epoch'):
         """Log training and validation metrics together.
         """
-        if self.logs:
-            if what == 'epoch':
-                train_metrics = self.epoch_train_metrics
-                valid_metrics = self.epoch_valid_metrics
-                step = self.epoch
+        train_dict = getattr(self, f'{what}_train_metrics')
+        valid_dict = getattr(self, f'{what}_valid_metrics')
+
+        train_metrics_dict = train_dict.get('mean_metrics', train_dict['metrics'])
+        valid_metrics_dict = valid_dict.get('mean_metrics', valid_dict['metrics'])
+
+        valid_iters_dict = valid_dict[f'{what}s']
+
+        # codist_loss and swadist_loss don't have validation metrics
+        for name in valid_metrics_dict.keys():
+
+            if name not in train_metrics_dict.keys():
+                continue
+
+            if what == 'step':
+                train_steps = train_dict['steps'][name]
+                train_metrics = [metric for itr, metric in zip(train_steps,
+                                                               train_metrics_dict[name])
+                                 if itr in valid_dict['steps'][name]]
             else:
-                train_metrics = self.step_train_metrics
-                valid_metrics = self.step_valid_metrics
-                step = self.step
+                train_metrics = train_metrics_dict[name]
 
-            # codist_loss and swadist_loss don't have validation metrics
-            for name in valid_metrics.keys():
-                scalars = { 'valid': valid_metrics[name][-1],
-                            'train': train_metrics[name][-1] }
+            assert len(valid_metrics_dict[name]) == len(train_metrics), \
+                (f'valid and train {name} {what} metrics have different lengths:'
+                 f'\nvalid len: {len(valid_metrics_dict[name])}'
+                 f'\ntrain len: {len(train_metrics)}')
 
+            assert len(valid_iters_dict[name]) == len(valid_metrics_dict[name]), \
+                (f'valid {name} {what}s has different length than corresponding metrics:'
+                 f'\n{what}s len: {len(valid_iters_dict[name])}'
+                 f'\nmetrics len: {len(valid_metrics_dict[name])}')
+
+            for i, valid_metric in enumerate(valid_metrics_dict[name]):
+
+                global_step = valid_iters_dict[name][i]
+
+                _name = name
                 if name != 'acc':
-                    name = f'loss/{name}'
+                    _name = f'loss/{name}'
 
-                self.writer.add_scalars(f'{what} {name}', scalars, step)
+                scalars = {
+                    'valid': valid_metric,
+                    'train': train_metrics[i],
+                }
+
+                self.writer.add_scalars(f'{what} {_name}', scalars, global_step)
+
+
+    def _log_metrics(self):
+        with torch.inference_mode():
+
+            self._log_separate()
+            self._log_separate('step')
+
+            self._log_together()
+            self._log_together('step')
+
+            self._log_hparam_metrics()
 
 
     def _log_hparam_metrics(self):
         log_dict = {}
 
         for what in ['step', 'epoch']:
-            metric_dict = deepcopy(getattr(self, f'{what}_valid_metrics'))
+            what_metrics_dict = getattr(self, f'{what}_valid_metrics')
+            metrics_dict = what_metrics_dict.get('mean_metrics', what_metrics_dict['metrics'])
+            whats_dict = what_metrics_dict[f'{what}s']
 
-            if what == 'step':
-                whats = metric_dict.pop('step')
-            else:
-                whats = range(1, self.epoch + 1)
+            for name, metrics in metrics_dict.items():
 
-            for name, metrics in metric_dict.items():
-
-                if not self.ddp and is_multiproc():
-                    metrics = torch.asarray(metrics, device=self.device)
-
-                    # get all ranks' metrics and take the mean
-                    _, metrics = all_reduce(metrics, op=torch.distributed.ReduceOp.AVG)
-
-                    metrics = metrics.cpu().numpy()
+                whats = whats_dict[name]
+                metrics = torch.asarray(metrics)
 
                 if name == 'acc':
-                    best_idx = np.argmax(metrics)
+                    best_idx = torch.argmax(metrics)
                 else:
-                    best_idx = np.argmin(metrics)
+                    best_idx = torch.argmin(metrics)
 
                 log_dict.update({
                     f'hparams {what}/best validation {name} {what}': whats[best_idx],
                     f'hparams {what}/best validation {name}': metrics[best_idx],
                 })
 
-            # print(f'log_dict: {log_dict}')
-
-        if self.logs:
-            self.writer.add_hparams(self.hparams, log_dict)
+        self.writer.add_hparams(self.hparams, log_dict)
 
 
     def save(self,
@@ -877,6 +975,7 @@ class Trainer():
              save_dir=None, # only if save_path is None
              **kwargs):
 
+        # TODO: deal with this when ddp for model replicas is implemented
         if self.ddp and self.rank != 0:
             return
 
@@ -887,6 +986,9 @@ class Trainer():
 
             if save_dir is None:
                 save_dir = self.save_dir
+
+            if not os.path.exists(save_dir):
+                pathlib.Path(save_dir).mkdir(parents=True, exist_ok=True)
 
             if not self.ddp and is_multiproc():
                 train_id = self.train_id + f'_rank{self.rank}'

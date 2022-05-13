@@ -5,6 +5,7 @@ import warnings
 import itertools
 
 from copy import deepcopy
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -99,12 +100,15 @@ class ReplicaLoss(object):
         self._handle = None
         self._flat_params = None
 
+        if self.sync_freq is None:
+            self.sync_freq = 0
+
         for i in range(self.world_size):
             if i == self.rank:
                 self.replicas.append(self._model)
             else:
                 self.replicas.append(deepcopy(self._model))
-                for param in self.replicas[i].parameters():
+                for param in self.replicas[-1].parameters():
                     param.detach()
 
         # block on cpu until all ranks are ready
@@ -151,11 +155,12 @@ class ReplicaLoss(object):
             if self.transform is not None:
                 mean_output = _transform_fns[self.transform](mean_output)
 
+        assert not mean_output.requires_grad
+
         return mean_output
 
 
     def _all_gather_params(self, force=None):
-
         if force == None:
             force = self.async_op
 
@@ -163,7 +168,7 @@ class ReplicaLoss(object):
             print(f'\nRank {self.rank} `_all_gather_params` at {self.__name__} step {self.step}')
 
         # move params to gpu
-        params = [param.to(self.rank) for param in self.replicas[self.rank].parameters()]
+        params = [param.to(self.rank).detach() for param in self.replicas[self.rank].parameters()]
 
         # _flat_params_list[i] is a single Tensor with all params from rank i
         self._handle, self._flat_params_list = all_gather(*params,
@@ -176,23 +181,26 @@ class ReplicaLoss(object):
         finished.
 
         """
-        if self._handle is None:
-            # begin comm
-            self._all_gather_params(force=force)
+        with torch.no_grad():
 
-        # update params if comm has finished
-        if self._handle.is_completed():
+            if self._handle is None:
+                # begin comm
+                self._all_gather_params(force=force)
 
-            if self.debug:
-                print(f'\nRank {self.rank} `update_replicas` at {self.__name__} step {self.step}')
+            # update params if comm has finished
+            if self._handle.is_completed():
 
-            # update the replicas' parameters
-            for i, flat_params in enumerate(self._flat_params_list):
-                if i != self.rank:
-                    vector_to_parameters(flat_params, self.replicas[i].parameters())
+                if self.debug:
+                    print(f'\nRank {self.rank} `update_replicas`: '
+                          f'async handle complete at {self.__name__} step {self.step}')
 
-            self._handle = None
-            self._flat_params_list = None
+                # update the replicas' parameters
+                for i, flat_params in enumerate(self._flat_params_list):
+                    if i != self.rank:
+                        vector_to_parameters(flat_params, self.replicas[i].parameters())
+
+                self._handle = None
+                self._flat_params_list = None
 
 
 
@@ -247,7 +255,12 @@ class SWADistLoss(ReplicaLoss):
     __________
     max_averaged: int, optional
         The max number of recent epoch-end model states to use in the `swa_model` average. Default
-        is all of the epochs, starting from the epoch that ended prior to the SWADist phase.
+        (None) uses all of the epochs, starting from the epoch that ended prior to the SWADist phase.
+    swa_replicas: bool, optional
+        If True, replicas are `torch.optim.swa_utils.AveragedModel`. If False, they are whatever
+        `model` is.
+    swa_inference: bool, optional
+        If True, evaluation is done with the SWA model. If False, it's done with `model`.
 
     See `ReplicaLoss` for other params.
 
@@ -260,42 +273,47 @@ class SWADistLoss(ReplicaLoss):
                  sync_freq=50,
                  max_averaged=None,
                  swa_replicas=False,
+                 swa_inference=True,
                  transform='softmax',
                  async_op=True,
                  debug=False):
         self.__name__ = 'SWADistLoss'
 
-        self.max_avgd = max_averaged
+        # TODO: finish implementing `swa_inference`
 
-        if self.max_avgd is not None and self.max_avgd <= 0:
-            self.max_avgd = None
+        self.rank = rank
+        self.model = model
+        self.max_avgd = max_averaged
+        self.swa_replicas = swa_replicas
+        self.swa_inference = swa_inference
+
+        # TODO: check inputs
+        # if self.max_avgd is not None and self.max_avgd > 1 not self.swa_inference and :
+        #     assert self.swa_replicas or (), \
+        #         ('SWADistLoss with max_averaged <=1 and swa_replicas == False'
+        #          'is just codistillation. Use CodstillationLoss instead.')
+
 
         # create the AveragedModel
-        if self.max_avgd is None:
-            self.swa_model = torch.optim.swa_utils.AveragedModel(model)
-
+        if self.max_avgd is not None and self.max_avgd > 1:
+            avg_fn = partial(self._avg_fn,
+                             max_averaged=torch.tensor(self.max_avgd, dtype=torch.long))
         else:
-            max_averaged = torch.tensor(self.max_avgd)
+            avg_fn = None
 
-            def avg_fn(averaged_modelparameter, _modelparameter, num_averaged):
+        self.swa_model = torch.optim.swa_utils.AveragedModel(model, avg_fn=avg_fn)
 
-                max_averaged.to(num_averaged.device)
-
-                if num_averaged < max_averaged:
-                    return averaged_modelparameter + \
-                        (_modelparameter - averaged_modelparameter) / (num_averaged + 1)
-                else:
-                    # _modelparameter is new model - oldest model in current avg
-                    return averaged_modelparameter + _modelparameter / max_averaged
-
-            self.swa_model = torch.optim.swa_utils.AveragedModel(model, avg_fn=avg_fn)
-
-        self.model = model
-
-        if swa_replicas:
-            _model = self.swa_model
+        if self.swa_replicas:
+            # between epochs, we'll update swadist_model_cp with current self.model
+            # state immediately before syncing
+            _model = self._cp_swa_model()
         else:
             _model = self.model
+
+        if self.swa_inference:
+            self.swadist_model = self.swa_model
+        else:
+            self.swadist_model = self.model
 
         super(SWADistLoss, self).__init__(loss_fn,
                                           _model,
@@ -310,6 +328,27 @@ class SWADistLoss(ReplicaLoss):
         self.epoch_models = []
 
 
+    @staticmethod
+    def _avg_fn(averaged_modelparameter,
+                _modelparameter,
+                num_averaged,
+                max_averaged=None):
+        """Like the default torch.optim.swa_utils.AveragedModel.avg_fn, but handles
+        windowed averaging.
+
+        """
+
+        if max_averaged is not None:
+            max_averaged.to(num_averaged.device)
+
+        if max_averaged is None or num_averaged < max_averaged:
+            return averaged_modelparameter + \
+                (_modelparameter - averaged_modelparameter) / (num_averaged + 1)
+        else:
+            # _modelparameter is new model - oldest model in current avg
+            return averaged_modelparameter + _modelparameter / max_averaged
+
+
     def __call__(self, x, output):
         """Calculate SWADist component of loss.
 
@@ -321,60 +360,109 @@ class SWADistLoss(ReplicaLoss):
             A batch of model outputs from this rank's model.
 
         """
+        if (self.swa_replicas and
+            # anticipate self.step += 1 in self.replica_mean_output
+            min(self.sync_freq, self.step) > 0 and
+            self.step % self.sync_freq == 0):
+
+            if self.debug:
+                print(f'\nRank {self.rank} syncing replica params at SWADist step {self.step}')
+
+            # update self.replicas[self.rank] before next replica sync
+
+            if self.max_avgd is not None and len(self.epoch_models) == self.max_avgd:
+                model = self._model_subtract(deepcopy(self.epoch_models[0]), self.model)
+            else:
+                model = self.model
+
+            self.replicas[self.rank].update_parameters(model)
+
         mean_output = self.replica_mean_output(x, output)
 
         return self.loss_fn(output, mean_output)
 
 
+    def update_swa_parameters(self):
+        """Updates this rank's `AveragedModel` with the current parameters of
+        `self.model`. If `self.max_avgd` is not None, then only the most recent
+        `max_averaged` models are included in the average. Called whenever
+        `Trainer.evaluate` is called.
+
+        """
+        with torch.no_grad():
+            if self.debug:
+                print(f'\nRank {self.rank} updating `AveragedModel` params '
+                      f'x{self.swa_model.n_averaged + 1}')
+
+            if self.max_avgd is not None and len(self.epoch_models) == self.max_avgd:
+
+                # window averaged SWA
+
+                if self.debug:
+                    print(f'\nRank {self.rank} updating `AveragedModel` params (windowed)')
+
+                self.epoch_models.append(deepcopy(self.model))
+
+                # subtract oldest model's params from new model's params
+                self._model_subtract(self.epoch_models[0], self.model)
+
+                # update the AveragedModel with the new model's remainder
+                self.swa_model.update_parameters(self.epoch_models[0])
+
+                # done with the oldest model, delete
+                del self.epoch_models[0]
+
+            else:
+                assert self.max_avgd is None or len(self.epoch_models) < self.max_avgd
+
+                # normal SWA
+                if self.debug:
+                    print(f'\nRank {self.rank} updating `AveragedModel` params (standard)')
+
+                self.swa_model.update_parameters(self.model)
+
+                if self.max_avgd is not None:
+                    self.epoch_models.append(deepcopy(self.model))
+
+            if self.swa_replicas:
+                self.replicas[self.rank] = self._cp_swa_model()
+
+
     def _zip_params(self, *models):
+        """Input should never include swa_model.
+
+        """
         params = [(itertools.chain(m.parameters(), m.buffers())
                    if self.swa_model.use_buffers else m.parameters())
                   for m in models if m is not None]
         return zip(*params)
 
 
-    def update_swa_parameters(self):
-        """Updates this rank's `AveragedModel` with the current parameters of
-        `self.model`. If `self.max_avgd` is not None, then only the most
-        recent `max_averaged` models are included in the average.
+    def _model_subtract(self, subtract_model, from_model):
+        """In-place update of subtract_model's parameters with the difference between
+        from_model and itself.
 
         """
-
-        if self.debug:
-            print(f'\nRank {self.rank} updating `AveragedModel` params '
-                  f'x{self.swa_model.n_averaged + 1}')
-
-        if self.max_avgd is not None and len(self.epoch_models) == self.max_avgd:
-
-            # window averaged SWA
-
-            if self.debug:
-                print(f'\nRank {self.rank} updating `AveragedModel` params (windowed)')
-
-            self.epoch_models.append(deepcopy(self.model))
-
+        with torch.no_grad():
             # subtract oldest model's params from new model's params
-            for p_model0, p_model in self._zip_params(self.epoch_models[0],
-                                                      deepcopy(self.model)):
+            for p_model0, p_model in self._zip_params(subtract_model, from_model):
                 device = p_model.device
                 p_model0.to(device)
                 p_model0.detach().mul_(-1).add_(p_model.detach())
 
-            # update the AveragedModel with the new model's remainder
-            self.swa_model.update_parameters(self.epoch_models[0])
+            return subtract_model
 
-            # done with the oldest model, delete
-            del self.epoch_models[0]
 
-        else:
-            assert self.max_avgd is None or len(self.epoch_models) < self.max_avgd
+    def _cp_swa_model(self):
+        """Returns a modifield copy of `self.swa_model`. Used at initialization and
+        whenever `update_swa_parameters` is called.
 
-            # normal SWA
-            if self.debug:
-                print(f'\nRank {self.rank} updating `AveragedModel` params (standard)')
+        """
+        with torch.no_grad():
+            # this cp will be updated with current self.model params right before sync
+            swa_model_cp = deepcopy(self.swa_model)
 
-            self.swa_model.update_parameters(self.model)
+            # swa_model_cp will average batch normalization buffers as training proceeds
+            swa_model_cp.use_buffers = True
 
-            if self.max_avgd is not None:
-                self.epoch_models.append(deepcopy(self.model))
-
+        return swa_model_cp

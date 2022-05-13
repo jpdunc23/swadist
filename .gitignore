@@ -55,12 +55,6 @@ cover/
 *.mo
 *.pot
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
 # Flask stuff:
 instance/
 .webassets-cache
@@ -155,11 +149,15 @@ cython_debug/
 *~
 .#
 
+# logs
+*.log
+!/experiments/*/results/log/*.log
+
 # tensorboard
-runs/
+events.out.*
 
 # downloaded data
 experiments/*/data
 
 # model artifacts
-experiments/*/state_dicts
+*.pt

@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import numpy as np
 
@@ -78,6 +79,7 @@ def spawn_fn(rank: int,
     # pin process to a single cuda device
     if cuda:
         torch.cuda.set_device(rank)
+        torch.cuda.synchronize()
         device = 'cuda'
     else:
         device = 'cpu'
@@ -129,6 +131,8 @@ def spawn_fn(rank: int,
     trainer_kwargs['rank'] = rank
     trainer_kwargs['device'] = device
     trainer_kwargs['world_size'] = world_size
+    trainer_kwargs['prints'] = rank == 0 and trainer_kwargs.get('prints', True)
+    trainer_kwargs['log'] = rank == 0 and trainer_kwargs.get('log', False)
 
     trainer = Trainer(**trainer_kwargs)
 
@@ -136,10 +140,17 @@ def spawn_fn(rank: int,
     save = train_kwargs.get('save', False)
     train_kwargs['save'] = False
 
+    if cuda:
+        # block until all ranks are ready
+        torch.cuda.synchronize()
+
+    if rank == 0:
+        print('Starting training from spawn_fn...')
+
     # start training
     trainer.train(**train_kwargs)
 
-    trainer.hparams['spawn_fn_seed'] = seed if seed is None else seed + rank
+    trainer.hparams['spawn_fn_seed'] = seed
 
     if save:
         trainer.save(save_dir=train_kwargs.get('save_dir', None))

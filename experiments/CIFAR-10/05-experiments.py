@@ -3,8 +3,6 @@
 """
 
 import os
-import time
-import pathlib
 import argparse
 import datetime
 
@@ -28,9 +26,6 @@ if __name__ == "__main__":
     logdir = args.logdir
     savedir = args.savedir
 
-    if not os.path.exists(savedir):
-        pathlib.Path(savedir).mkdir(parents=True, exist_ok=True)
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         print('Using cuda')
@@ -47,8 +42,9 @@ if __name__ == "__main__":
         'dataloader_kwargs': {
             'dataset': 'cifar10',
             'root_dir': datadir,
-            'num_workers': 4,
+            'num_workers': 1,
             'data_parallel': True,
+            # 'pin_memory': True, # set in spawn_fn
         },
         'model_kwargs': {
             'n_classes': 10,
@@ -63,29 +59,20 @@ if __name__ == "__main__":
             'log': True,
             'log_dir': logdir,
             'save_dir': savedir,
-            'n_print': 10,
+            'n_print': 0,
         },
         'train_kwargs': {
-            'codist_kwargs': {
-                'sync_freq': 50,
-                'transform': 'softmax',
-            },
             'swadist_kwargs': {
-                'sync_freq': 50,
                 'transform': 'softmax',
-                'max_averaged': 5,
+                'max_averaged': 3,
             },
-            'validations_per_epoch': 4,
-            'stopping_acc': 0.75,
+            'stopping_acc': 0.7,
+            'stop_stall_n_epochs': 20,
             'save': True,
         },
         'scheduler_kwargs': {
             'alpha': 0.25,
-            'decay_epochs': 15,
-        },
-        'swa_scheduler_kwargs': {
-            'anneal_strategy': 'cos',
-            'anneal_epochs': 5,
+            'decay_epochs': 50,
         },
     }
 
@@ -106,50 +93,69 @@ if __name__ == "__main__":
     seed = int((datetime.date.today() - datetime.date(2022, 4, 11)).total_seconds())
     print(f'seed: {seed}')
 
-    methods = ['swadist', 'sgd', 'swa', 'codist', 'codistswa']
+    methods = ['swadist', 'swadist-replicas', 'codist', 'sgd']
     method_kwargs = { method: deepcopy(common_kwargs) for method in methods }
 
-    # method_kwargs['swadist']['dataloader_kwargs'].update({ 'split_training': True })
+    # swadist w/o SWA replicas
     method_kwargs['swadist']['trainer_kwargs'].update({ 'name': 'swadist' })
     method_kwargs['swadist']['train_kwargs'].update({ 'epochs_sgd': 0,
                                                       'epochs_codist': 0,
-                                                      'epochs_swa': 50,
+                                                      'epochs_swa': 200,
                                                       'swadist': True })
 
-    # method_kwargs['sgd']['dataloader_kwargs'].update({ 'data_parallel': True })
-    method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
-    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 50, 'codist_kwargs': None })
+    # swadist with SWA replicas
+    method_kwargs['swadist-replicas']['trainer_kwargs'].update({ 'name': 'swadist-replicas' })
+    method_kwargs['swadist-replicas']['train_kwargs'].update({ 'epochs_sgd': 0,
+                                                               'epochs_codist': 0,
+                                                               'epochs_swa': 200,
+                                                               'swadist': True })
+    method_kwargs['swadist-replicas']['train_kwargs']['swadist_kwargs'].update(
+        { 'swa_replicas': True }
+    )
 
-    # method_kwargs['codist']['dataloader_kwargs'].update({ 'split_training': True })
+    # codist
     method_kwargs['codist']['trainer_kwargs'].update({ 'name': 'codist' })
-    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 40 })
+    method_kwargs['codist']['train_kwargs'].update({ 'epochs_sgd': 0,
+                                                     'epochs_codist': 200,
+                                                     'epochs_swa': 0 })
+    method_kwargs['codist']['train_kwargs']['swadist_kwargs'] = None
+    method_kwargs['codist']['train_kwargs']['codist_kwargs'] = {
+        'sync_freq': 50,
+        'transform': 'softmax',
+    }
 
-    # method_kwargs['swa']['dataloader_kwargs'].update({ 'data_parallel': True })
-    method_kwargs['swa']['trainer_kwargs'].update({ 'name': 'swa' })
-    method_kwargs['swa']['train_kwargs'].update({ 'epochs_sgd': 40, 'epochs_swa': 10, 'codist_kwargs': None })
-
-    # method_kwargs['codistswa']['dataloader_kwargs'].update({ 'split_training': True })
-    method_kwargs['codistswa']['trainer_kwargs'].update({ 'name': 'codistswa' })
-    method_kwargs['codistswa']['train_kwargs'].update({ 'epochs_sgd': 10, 'epochs_codist': 30, 'epochs_swa': 10 })
+    # SGD
+    method_kwargs['sgd']['trainer_kwargs'].update({ 'name': 'sgd' })
+    method_kwargs['sgd']['train_kwargs'].update({ 'epochs_sgd': 200, 'swadist_kwargs': None })
 
     for bs, lr, mo in zip(batch_size, lr0, momentum):
 
         for method, kwargs in method_kwargs.items():
 
+            if method == 'swadist-replicas':
+                what = 'swadist'
+            else:
+                what = method
+
+            if bs < 4096:
+                continue
+            else:
+                epochs_ = "epochs_swa" if what == 'swadist' else f'epochs_{what}'
+                kwargs['train_kwargs'][epochs_] = 400
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            if what in ['codist', 'swadist']:
+                # get ~3 syncs per epoch
+                sync_freq = int(np.ceil(45000 / (3*bs)))
+                kwargs['train_kwargs'][f'{what}_kwargs']['sync_freq'] = sync_freq
 
             trainer_kwargs = deepcopy(kwargs['trainer_kwargs'])
             trainer_kwargs['name'] = f'bs{bs}-' + trainer_kwargs['name']
 
             kwargs['dataloader_kwargs']['batch_size'] = bs // world_size
             kwargs['optimizer_kwargs'].update({ 'lr': lr, 'momentum': mo })
-            kwargs['swa_scheduler_kwargs']['swa_lr'] = lr / 10
-
-            if method not in ['swa', 'codistswa']:
-                swa_scheduler_kwargs = None
-            else:
-                swa_scheduler_kwargs = kwargs['swa_scheduler_kwargs']
 
             args = (world_size,
                     kwargs['dataloader_kwargs'],
@@ -158,11 +164,7 @@ if __name__ == "__main__":
                     trainer_kwargs,
                     kwargs['train_kwargs'],
                     kwargs['scheduler_kwargs'],
-                    swa_scheduler_kwargs,
+                    None, # swa_scheduler_kwargs,
                     seed)
 
-            tic = time.perf_counter()
-
             torch.multiprocessing.spawn(spawn_fn, args=args, nprocs=world_size, join=True)
-
-            print(f'time elapsed: {(time.perf_counter() - tic) / 60:.2f}m')
