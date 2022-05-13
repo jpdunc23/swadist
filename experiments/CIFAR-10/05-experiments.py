@@ -67,6 +67,7 @@ if __name__ == "__main__":
                 'max_averaged': 3,
             },
             'stopping_acc': 0.7,
+            'stop_stall_n_epochs': 20,
             'save': True,
         },
         'scheduler_kwargs': {
@@ -131,15 +132,16 @@ if __name__ == "__main__":
 
         for method, kwargs in method_kwargs.items():
 
-            if bs < 4096:
-                continue
-            else:
-                kwargs['train_kwargs'][f'epochs_{what}'] = 400
-
             if method == 'swadist-replicas':
                 what = 'swadist'
             else:
                 what = method
+
+            if bs < 4096:
+                continue
+            else:
+                epochs_ = "epochs_swa" if what == 'swadist' else f'epochs_{what}'
+                kwargs['train_kwargs'][epochs_] = 400
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

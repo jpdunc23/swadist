@@ -360,7 +360,7 @@ class Trainer():
 
     def _check_for_stall(self):
 
-        if self.stop_early:
+        if self.stop_early or self.epoch % self.stop_stall_n_epochs != 0:
             return
 
         # stop current phase early if training has stalled out (avg acc of most
