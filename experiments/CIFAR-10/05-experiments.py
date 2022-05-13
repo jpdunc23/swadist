@@ -63,7 +63,6 @@ if __name__ == "__main__":
         },
         'train_kwargs': {
             'swadist_kwargs': {
-                'sync_freq': 50,
                 'transform': 'softmax',
                 'max_averaged': 3,
             },
@@ -77,15 +76,15 @@ if __name__ == "__main__":
     }
 
     # batch_size
-    batch_size = [2**i for i in range(1, 14)]
-    # batch_size = [2**i for i in range(6, 14)]
+    # batch_size = [2**i for i in range(1, 14)]
+    batch_size = [2**i for i in range(6, 14)]
 
     # initial lr and momentum
-    lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
-    # lr0 = 2**np.array([-5., -5., -5., -6., -5., -7., -4., -6.])
+    # lr0 = 2**np.array([-8.5, -12.5, -5., -8.5, -7., -5., -5., -5., -6., -5, -7, -4, -6])
+    lr0 = 2**np.array([-5., -5., -5., -6., -5., -7., -4., -6.])
 
-    momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
-    # momentum = [.95, .97, .975, .98, .975, .98, .97, .975]
+    # momentum = [.675, .98, .63, .97, .975, .95, .97, .975, .98, .975, .98, .97, .975]
+    momentum = [.95, .97, .975, .98, .975, .98, .97, .975]
 
     assert len(lr0) == len(batch_size), 'lr0 has the wrong size'
     assert len(momentum) == len(batch_size), 'momentum has the wrong size'
@@ -134,6 +133,12 @@ if __name__ == "__main__":
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            if method in ['codist', 'swadist', 'swadist-replicas']:
+                # get ~3 syncs per epoch
+                sync_freq = int(np.ceil(45000 / (3*bs)))
+                what = 'codist' if method == 'codist' else 'swadist'
+                kwargs['train_kwargs'][f'{what}_kwargs']['sync_freq'] = sync_freq
 
             trainer_kwargs = deepcopy(kwargs['trainer_kwargs'])
             trainer_kwargs['name'] = f'bs{bs}-' + trainer_kwargs['name']
