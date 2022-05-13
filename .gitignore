@@ -149,6 +149,10 @@ cython_debug/
 *~
 .#
 
+# logs
+*.log
+!/experiments/*/results/log/*.log
+
 # tensorboard
 events.out.*
 
