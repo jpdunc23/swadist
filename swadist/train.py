@@ -409,7 +409,7 @@ class Trainer():
             # already stopped early
             return
 
-        acc = self.epoch_valid_metrics['acc'][-1]
+        acc = self.epoch_valid_metrics['metrics']['acc'][-1]
 
         if not self.ddp and is_multiproc():
 
